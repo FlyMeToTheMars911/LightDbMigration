@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Light DB Migration</title>
+    <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="topbar">
+    <div>
+        <div class="brand"><span class="brand-mark">L</span> Light DB Migration</div>
+        <p>轻量、安全、可观察的现场数据迁移工具</p>
+    </div>
+    <div class="server-state"><span id="serverDot" class="state-dot"></span><span id="serverText">正在连接服务…</span></div>
+</header>
+
+<main class="page-shell">
+    <section class="notice">
+        <strong>使用提示</strong>
+        <span>最近一次两端数据库配置（含密码）会加密保存在服务本机 data 目录，重启后自动回填；密码不会写入日志。开始迁移前会先完成全部结构校验。</span>
+    </section>
+
+    <section class="panel">
+        <div class="section-heading">
+            <div><span class="step-number">1</span><h2>配置两端数据库</h2></div>
+            <div>
+                <span class="heading-note">每个迁移任务都可以使用不同的数据库配置</span>
+                <button type="button" id="saveCurrentConfigButton" class="button secondary small">保存当前配置</button>
+                <button type="button" id="clearSavedConfigButton" class="button ghost small">清除记忆配置</button>
+            </div>
+        </div>
+        <div class="database-grid">
+            <article class="database-card" data-db="source">
+                <div class="card-title-row">
+                    <h3>源数据库</h3>
+                    <button type="button" class="button secondary small test-connection" data-prefix="source">测试连接</button>
+                </div>
+                <div class="form-grid">
+                    <label>数据库类型
+                        <select id="sourceType" class="db-type" data-prefix="source">
+                            <option value="MYSQL">MySQL</option>
+                            <option value="ORACLE">Oracle</option>
+                        </select>
+                    </label>
+                    <label>主机地址<input id="sourceHost" type="text" placeholder="例如 10.0.0.10" autocomplete="off"></label>
+                    <label>端口<input id="sourcePort" type="number" value="3306" min="1" max="65535"></label>
+                    <label class="database-name-label"><span id="sourceDatabaseLabel">数据库名</span><input id="sourceDatabase" type="text" placeholder="例如 business_db" autocomplete="off"></label>
+                    <label class="oracle-mode hidden" id="sourceOracleModeWrap">Oracle 连接方式
+                        <select id="sourceOracleMode"><option value="SERVICE">服务名</option><option value="SID">SID</option></select>
+                    </label>
+                    <label>用户名<input id="sourceUsername" type="text" autocomplete="off"></label>
+                    <label>密码<input id="sourcePassword" type="password" autocomplete="new-password"></label>
+                </div>
+                <details class="advanced-config">
+                    <summary>高级：直接填写 JDBC URL</summary>
+                    <label>JDBC URL（填写后优先使用）<input id="sourceJdbcUrl" type="text" placeholder="jdbc:mysql://... 或 jdbc:oracle:thin:@..." autocomplete="off"></label>
+                </details>
+                <div id="sourceTestResult" class="test-result"></div>
+            </article>
+
+            <div class="direction" aria-hidden="true"><span>源</span><b>→</b><span>目标</span></div>
+
+            <article class="database-card" data-db="target">
+                <div class="card-title-row">
+                    <h3>目标数据库</h3>
+                    <button type="button" class="button secondary small test-connection" data-prefix="target">测试连接</button>
+                </div>
+                <div class="form-grid">
+                    <label>数据库类型
+                        <select id="targetType" class="db-type" data-prefix="target">
+                            <option value="MYSQL">MySQL</option>
+                            <option value="ORACLE">Oracle</option>
+                        </select>
+                    </label>
+                    <label>主机地址<input id="targetHost" type="text" placeholder="例如 10.0.0.20" autocomplete="off"></label>
+                    <label>端口<input id="targetPort" type="number" value="3306" min="1" max="65535"></label>
+                    <label class="database-name-label"><span id="targetDatabaseLabel">数据库名</span><input id="targetDatabase" type="text" placeholder="例如 target_db" autocomplete="off"></label>
+                    <label class="oracle-mode hidden" id="targetOracleModeWrap">Oracle 连接方式
+                        <select id="targetOracleMode"><option value="SERVICE">服务名</option><option value="SID">SID</option></select>
+                    </label>
+                    <label>用户名<input id="targetUsername" type="text" autocomplete="off"></label>
+                    <label>密码<input id="targetPassword" type="password" autocomplete="new-password"></label>
+                </div>
+                <details class="advanced-config">
+                    <summary>高级：直接填写 JDBC URL</summary>
+                    <label>JDBC URL（填写后优先使用）<input id="targetJdbcUrl" type="text" placeholder="jdbc:mysql://... 或 jdbc:oracle:thin:@..." autocomplete="off"></label>
+                </details>
+                <div id="targetTestResult" class="test-result"></div>
+            </article>
+        </div>
+    </section>
+
+    <section class="panel">
+        <div class="section-heading">
+            <div><span class="step-number">2</span><h2>编排迁移 SQL</h2></div>
+            <button type="button" id="addStepButton" class="button secondary">＋ 添加一条 SQL</button>
+        </div>
+        <div class="task-base-grid">
+            <label>任务名称<input id="taskName" type="text" placeholder="例如：客户基础数据迁移"></label>
+            <label>每批行数<input id="batchSize" type="number" value="1000" min="1" max="10000"></label>
+        </div>
+        <div class="field-help">同一任务中的 SQL 会按从上到下的顺序逐条执行。全部 SQL 的结构校验通过后，才会写入第一批数据。</div>
+        <div id="stepsContainer" class="steps-container"></div>
+        <div class="create-bar">
+            <div>
+                <strong>创建后不会立即写库</strong>
+                <span>请在下方任务列表中再次点击“启动”，便于最后核对。</span>
+            </div>
+            <button type="button" id="createTaskButton" class="button primary">创建迁移任务</button>
+        </div>
+    </section>
+
+    <section class="panel task-panel">
+        <div class="section-heading">
+            <div><span class="step-number">3</span><h2>任务进度与控制</h2></div>
+            <button type="button" id="refreshTasksButton" class="button ghost">刷新</button>
+        </div>
+        <div id="emptyTasks" class="empty-state">
+            <div class="empty-icon">◎</div>
+            <strong>暂无迁移任务</strong>
+            <span>完成上方配置并创建任务后，可在这里启动和查看进度。</span>
+        </div>
+        <div id="tasksContainer" class="tasks-container"></div>
+    </section>
+
+    <section id="logPanel" class="panel log-panel hidden">
+        <div class="section-heading">
+            <div><span class="step-number">4</span><h2>任务日志</h2><span id="logTaskName" class="log-task-name"></span></div>
+            <div class="log-actions">
+                <label class="auto-scroll"><input id="autoScroll" type="checkbox" checked> 自动滚动</label>
+                <button type="button" id="closeLogButton" class="button ghost">关闭</button>
+            </div>
+        </div>
+        <div id="logContent" class="log-content"></div>
+        <section id="structureSyncPanel" class="structure-sync-panel hidden">
+            <div class="structure-sync-heading">
+                <div>
+                    <h3>表结构同步建议脚本</h3>
+                    <p>工具不会自动执行。请先备份目标表，并由开发人员或 DBA 审核后再使用。</p>
+                </div>
+                <div class="structure-sync-actions">
+                    <button type="button" id="copyStructureScriptButton" class="button secondary small">复制脚本</button>
+                    <button type="button" id="downloadStructureScriptButton" class="button ghost small">下载 SQL</button>
+                </div>
+            </div>
+            <textarea id="structureSyncScript" class="structure-sync-script" rows="18" readonly spellcheck="false"></textarea>
+        </section>
+    </section>
+</main>
+
+<div id="toast" class="toast" role="status"></div>
+
+<template id="migrationStepTemplate">
+    <article class="migration-step">
+        <div class="migration-step-head">
+            <strong class="migration-step-title">SQL 1</strong>
+            <button type="button" class="icon-button remove-step" title="删除本条 SQL">×</button>
+        </div>
+        <div class="step-form-grid">
+            <label>步骤名称<input class="step-name" type="text" placeholder="例如：迁移客户表"></label>
+            <label>目标表<input class="target-table" type="text" placeholder="表名或 模式名.表名"></label>
+            <label>递增唯一游标字段（没有则留空）<input class="cursor-column" type="text" placeholder="例如 ID 或 APP_UUID"></label>
+            <label>写入方式
+                <select class="insert-mode">
+                    <option value="IGNORE_DUPLICATE">跳过重复数据（默认）</option>
+                    <option value="STRICT_INSERT">普通插入（遇重复即失败）</option>
+                </select>
+            </label>
+        </div>
+        <label>源数据库查询 SQL
+            <textarea class="source-sql" rows="7" spellcheck="false" placeholder="SELECT ID, NAME, CREATED_AT FROM SOURCE_TABLE ORDER BY ID"></textarea>
+        </label>
+        <div class="field-help">SQL 只允许 SELECT/WITH。游标由页面配置为准，不要求数据库自增标记或数值类型；字段须在本次查询结果中非空、唯一，并能按数据库顺序持续递增。</div>
+    </article>
+</template>
+
+<script src="/app.js"></script>
+</body>
+</html>
