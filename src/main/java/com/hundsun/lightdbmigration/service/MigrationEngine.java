@@ -30,6 +30,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
 
 @Component
 public class MigrationEngine {
@@ -966,18 +967,20 @@ public class MigrationEngine {
             ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
             statement.setFetchSize(batchSize);
             task.setCurrentStatement(statement);
+            long batchStartedNanos = System.nanoTime();
             try (ResultSet resultSet = statement.executeQuery()) {
                 List<Object[]> batch = new ArrayList<>(batchSize);
                 while (resultSet.next()) {
                     batch.add(readRow(resultSet, step.sourceColumns));
                     if (batch.size() >= batchSize) {
-                        writeAndReportBatch(task, targetConnection, step, batch, targetType);
+                        writeAndReportBatch(task, targetConnection, step, batch, targetType, batchStartedNanos);
                         batch.clear();
                         task.checkpoint();
+                        batchStartedNanos = System.nanoTime();
                     }
                 }
                 if (!batch.isEmpty()) {
-                    writeAndReportBatch(task, targetConnection, step, batch, targetType);
+                    writeAndReportBatch(task, targetConnection, step, batch, targetType, batchStartedNanos);
                     task.checkpoint();
                 }
             } finally {
@@ -996,6 +999,7 @@ public class MigrationEngine {
         Object lastKey = null;
         while (true) {
             task.checkpoint();
+            long batchStartedNanos = System.nanoTime();
             KeysetSql keysetSql = buildKeysetSql(step, cursorColumn, sourceType, batchSize, lastKey != null);
             List<Object[]> batch = new ArrayList<>(batchSize);
             Object currentLastKey = null;
@@ -1031,7 +1035,7 @@ public class MigrationEngine {
             if (lastKey != null && cursorValuesEqual(lastKey, currentLastKey)) {
                 throw new IllegalArgumentException("游标字段未推进，当前值=" + currentLastKey);
             }
-            writeAndReportBatch(task, targetConnection, step, batch, targetType);
+            writeAndReportBatch(task, targetConnection, step, batch, targetType, batchStartedNanos);
             lastKey = currentLastKey;
             if (batch.size() < batchSize || cursorValuesEqual(lastKey, upperBound)) {
                 break;
@@ -1091,12 +1095,20 @@ public class MigrationEngine {
     }
 
     private void writeAndReportBatch(MigrationTask task, Connection targetConnection, PreparedStep step,
-        List<Object[]> batch, String targetType) throws Exception {
+        List<Object[]> batch, String targetType, long batchStartedNanos) throws Exception {
+        long writeStartedNanos = System.nanoTime();
         BatchResult batchResult = writeBatch(task, targetConnection, step, batch, targetType);
+        long writeElapsedMillis = elapsedMillis(writeStartedNanos);
         task.addBatch(step.index, batch.size(), batchResult.inserted, batchResult.ignored);
+        long batchElapsedMillis = elapsedMillis(batchStartedNanos);
         task.info("步骤 " + step.displayName + " 完成第 " + batchResult.batchNumberHint
             + " 批：读取 " + batch.size() + " 行，写入 " + batchResult.inserted
-            + " 行，跳过 " + batchResult.ignored + " 行");
+            + " 行，跳过 " + batchResult.ignored + " 行，批次总耗时 " + batchElapsedMillis
+            + " ms（目标写入及提交 " + writeElapsedMillis + " ms）");
+    }
+
+    private long elapsedMillis(long startedNanos) {
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos);
     }
 
     private BatchResult writeBatch(MigrationTask task, Connection connection, PreparedStep step, List<Object[]> batch,

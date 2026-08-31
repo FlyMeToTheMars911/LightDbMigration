@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 使用轻量 JDBC 代理验证：同一步骤和后续步骤的结构问题会一次性汇总。
@@ -44,6 +45,7 @@ public class StructureValidationAggregationCheck {
     private static final String APPLICATION_CURSOR = "APP_UUID";
     private static final String CURSOR_SOURCE = "CURSOR_SOURCE";
     private static final String CURSOR_TARGET = "CURSOR_TARGET";
+    private static final long MOCK_BATCH_ELAPSED_MILLIS = 5L;
 
     private final AtomicInteger sourceMetadataQueries = new AtomicInteger();
     private final AtomicInteger targetMetadataQueries = new AtomicInteger();
@@ -120,6 +122,51 @@ public class StructureValidationAggregationCheck {
         verifyOracleCreateTableScript(engine);
         verifyConnectionFailureDetection(engine);
         verifyConfiguredTextCursorAccepted(engine);
+        verifyBatchTimingLog(engine);
+    }
+
+    private void verifyBatchTimingLog(MigrationEngine engine) throws Exception {
+        Class<?> columnMetaClass = Class.forName(MigrationEngine.class.getName() + "$ColumnMeta");
+        Constructor<?> columnConstructor = columnMetaClass.getDeclaredConstructor(String.class, int.class,
+            String.class, int.class, int.class, int.class, boolean.class);
+        columnConstructor.setAccessible(true);
+        Object idColumn = columnConstructor.newInstance("ID", Types.BIGINT, "BIGINT", 19, 0,
+            DatabaseMetaData.columnNoNulls, false);
+        List<Object> columns = Arrays.asList(idColumn);
+
+        Class<?> preparedStepClass = Class.forName(MigrationEngine.class.getName() + "$PreparedStep");
+        Constructor<?> stepConstructor = preparedStepClass.getDeclaredConstructor(int.class, String.class,
+            String.class, QualifiedName.class, List.class, List.class, int.class, long.class, String.class,
+            String.class, String.class, boolean.class);
+        stepConstructor.setAccessible(true);
+        Object preparedStep = stepConstructor.newInstance(0, "批次耗时测试", "SELECT ID FROM TIMING_SOURCE",
+            SqlSupport.parseTargetTable("TIMING_TARGET"), columns, columns, -1, MOCK_TOTAL_ROWS,
+            MigrationConstants.INSERT_IGNORE, "INSERT INTO TIMING_TARGET (`ID`) VALUES (?)",
+            "INSERT INTO TIMING_TARGET (`ID`) VALUES (?)", false);
+
+        CreateTaskRequest request = new CreateTaskRequest();
+        request.setBatchSize(MigrationConstants.DEFAULT_BATCH_SIZE);
+        request.setSource(databaseConfig());
+        request.setTarget(databaseConfig());
+        request.setSteps(Arrays.asList(step("批次耗时测试", "SELECT ID FROM TIMING_SOURCE", "TIMING_TARGET", null)));
+        MigrationTask task = new MigrationTask("BATCH-TIMING-CHECK", request);
+        Method writeAndReport = MigrationEngine.class.getDeclaredMethod("writeAndReportBatch",
+            MigrationTask.class, Connection.class, preparedStepClass, List.class, String.class, long.class);
+        writeAndReport.setAccessible(true);
+        List<Object[]> batch = Arrays.asList(new Object[] {1L}, new Object[] {2L});
+        long batchStartedNanos = System.nanoTime() - TimeUnit.MILLISECONDS.toNanos(MOCK_BATCH_ELAPSED_MILLIS);
+        writeAndReport.invoke(engine, task, batchConnection(), preparedStep, batch, MigrationConstants.DB_MYSQL,
+            batchStartedNanos);
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> logs = (List<Map<String, Object>>)task.snapshot(true, 0L).get("logs");
+        for (Map<String, Object> log : logs) {
+            String message = String.valueOf(log.get("message"));
+            if (message.matches(".*完成第 1 批.*批次总耗时 [0-9]+ ms（目标写入及提交 [0-9]+ ms）")) {
+                return;
+            }
+        }
+        throw new AssertionError("批次完成日志缺少总耗时或目标写入提交耗时：" + logs);
     }
 
     private void verifyConfiguredTextCursorAccepted(MigrationEngine engine) throws Exception {
@@ -281,6 +328,46 @@ public class StructureValidationAggregationCheck {
                         statisticsSql.set(sql);
                         return cursorStatisticsResultSet();
                     }
+                }
+                if ("hashCode".equals(name)) {
+                    return System.identityHashCode(proxy);
+                }
+                if ("equals".equals(name)) {
+                    return proxy == arguments[0];
+                }
+                return defaultValue(method.getReturnType());
+            }
+        };
+        return proxy(PreparedStatement.class, handler);
+    }
+
+    private Connection batchConnection() {
+        InvocationHandler handler = new InvocationHandler() {
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] arguments) {
+                String name = method.getName();
+                if ("prepareStatement".equals(name)) {
+                    return batchPreparedStatement();
+                }
+                if ("hashCode".equals(name)) {
+                    return System.identityHashCode(proxy);
+                }
+                if ("equals".equals(name)) {
+                    return proxy == arguments[0];
+                }
+                return defaultValue(method.getReturnType());
+            }
+        };
+        return proxy(Connection.class, handler);
+    }
+
+    private PreparedStatement batchPreparedStatement() {
+        InvocationHandler handler = new InvocationHandler() {
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] arguments) {
+                String name = method.getName();
+                if ("executeBatch".equals(name)) {
+                    return new int[] {1, 1};
                 }
                 if ("hashCode".equals(name)) {
                     return System.identityHashCode(proxy);
