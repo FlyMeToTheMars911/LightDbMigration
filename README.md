@@ -15,13 +15,18 @@
 
 ## 开发打包
 
-项目使用 Maven 管理依赖，发布包由开发人员执行：
+项目使用 Maven 管理依赖，打包环境要求 JDK 8 和 Maven 3.6.3 及以上版本。开发人员执行一次命令即可同时生成可执行 Jar 和现场交付 ZIP：
 
 ```text
 mvn clean package -DskipTests
 ```
 
-生成文件：`target/light-db-migration.jar`。
+生成文件：
+
+- `target/light-db-migration.jar`：可执行服务。
+- `target/light-db-migration-<项目版本>.zip`：完整现场交付包，包含 Jar、README、Windows/Linux 启动脚本及完整 `docs` 文档目录。
+
+不需要再手工复制文件或二次压缩。
 
 现场人员不需要 Maven，只需 64 位 JDK 8、发布 Jar 和启动脚本。完整说明见 [现场实施操作手册](docs/现场实施操作手册.md)，本次真实数据库验证见 [现场实测报告](docs/现场实测报告.md)，架构和核心实现见 [开发人员设计说明](docs/开发人员设计说明.md)。
 
