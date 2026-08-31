@@ -35,17 +35,31 @@ public final class SqlSupport {
     }
 
     public static QualifiedName parseTargetTable(String targetTable) {
-        String value = targetTable == null ? "" : targetTable.trim();
+        return parseTableName(targetTable, "目标表");
+    }
+
+    public static QualifiedName parseTableName(String tableName, String label) {
+        String safeLabel = label == null || label.trim().isEmpty() ? "数据表" : label.trim();
+        String value = tableName == null ? "" : tableName.trim();
         String[] parts = value.split("\\.", -1);
         if (parts.length < 1 || parts.length > 2) {
-            throw new IllegalArgumentException("目标表只支持 表名 或 模式名.表名 格式");
+            throw new IllegalArgumentException(safeLabel + "只支持 表名 或 模式名.表名 格式");
         }
         for (String part : parts) {
             if (!SAFE_IDENTIFIER.matcher(part).matches()) {
-                throw new IllegalArgumentException("目标表名只能包含字母、数字、下划线、$ 或 #");
+                throw new IllegalArgumentException(safeLabel + "名称只能包含字母、数字、下划线、$ 或 #");
             }
         }
         return parts.length == 1 ? new QualifiedName(null, parts[0]) : new QualifiedName(parts[0], parts[1]);
+    }
+
+    public static String normalizeColumnName(String columnName, String label) {
+        String safeLabel = label == null || label.trim().isEmpty() ? "字段" : label.trim();
+        String value = columnName == null ? "" : columnName.trim();
+        if (!SAFE_IDENTIFIER.matcher(value).matches()) {
+            throw new IllegalArgumentException(safeLabel + "只能包含字母、数字、下划线、$ 或 #");
+        }
+        return value;
     }
 
     public static String quoteIdentifier(String identifier, String databaseType) {

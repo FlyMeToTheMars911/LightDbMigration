@@ -10,7 +10,7 @@
 <header class="topbar">
     <div>
         <div class="brand"><span class="brand-mark">L</span> Light DB Migration</div>
-        <p>轻量、安全、可观察的现场数据迁移工具</p>
+        <p>轻量、安全、可观察的现场数据迁移与归档工具</p>
     </div>
     <div class="server-state"><span id="serverDot" class="state-dot"></span><span id="serverText">正在连接服务…</span></div>
 </header>
@@ -18,22 +18,31 @@
 <main class="page-shell">
     <section class="notice">
         <strong>使用提示</strong>
-        <span>最近一次两端数据库配置（含密码）会加密保存在服务本机 data 目录，重启后自动回填；密码不会写入日志。开始迁移前会先完成全部结构校验。</span>
+        <span>最近一次数据库配置（含密码）会加密保存在服务本机 data 目录，密码不会写入日志。迁移和归档都会先完成结构校验；归档还会在每个主表批次内校验写入、按子表先于主表的顺序删除。</span>
     </section>
 
     <section class="panel">
         <div class="section-heading">
-            <div><span class="step-number">1</span><h2>配置两端数据库</h2></div>
+            <div><span class="step-number">1</span><h2 id="databaseHeading">配置两端数据库</h2></div>
             <div>
                 <span class="heading-note">每个迁移任务都可以使用不同的数据库配置</span>
                 <button type="button" id="saveCurrentConfigButton" class="button secondary small">保存当前配置</button>
                 <button type="button" id="clearSavedConfigButton" class="button ghost small">清除记忆配置</button>
             </div>
         </div>
-        <div class="database-grid">
+        <div class="operation-mode">
+            <label>任务类型
+                <select id="taskType">
+                    <option value="MIGRATION">数据迁移（源库复制到目标库）</option>
+                    <option value="ARCHIVE">数据归档（同库转移后删除源数据）</option>
+                </select>
+            </label>
+            <span id="taskTypeHelp">数据迁移使用独立的源库和目标库连接。</span>
+        </div>
+        <div id="databaseGrid" class="database-grid">
             <article class="database-card" data-db="source">
                 <div class="card-title-row">
-                    <h3>源数据库</h3>
+                    <h3 id="sourceDatabaseTitle">源数据库</h3>
                     <button type="button" class="button secondary small test-connection" data-prefix="source">测试连接</button>
                 </div>
                 <div class="form-grid">
@@ -59,9 +68,9 @@
                 <div id="sourceTestResult" class="test-result"></div>
             </article>
 
-            <div class="direction" aria-hidden="true"><span>源</span><b>→</b><span>目标</span></div>
+            <div id="databaseDirection" class="direction" aria-hidden="true"><span>源</span><b>→</b><span>目标</span></div>
 
-            <article class="database-card" data-db="target">
+            <article id="targetDatabaseCard" class="database-card" data-db="target">
                 <div class="card-title-row">
                     <h3>目标数据库</h3>
                     <button type="button" class="button secondary small test-connection" data-prefix="target">测试连接</button>
@@ -93,19 +102,46 @@
 
     <section class="panel">
         <div class="section-heading">
-            <div><span class="step-number">2</span><h2>编排迁移 SQL</h2></div>
+            <div><span class="step-number">2</span><h2 id="configurationHeading">编排迁移 SQL</h2></div>
             <button type="button" id="addStepButton" class="button secondary">＋ 添加一条 SQL</button>
         </div>
         <div class="task-base-grid">
             <label>任务名称<input id="taskName" type="text" placeholder="例如：客户基础数据迁移"></label>
             <label>每批行数<input id="batchSize" type="number" value="1000" min="1" max="10000"></label>
         </div>
-        <div class="field-help">同一任务中的 SQL 会按从上到下的顺序逐条执行。全部 SQL 的结构校验通过后，才会写入第一批数据。</div>
-        <div id="stepsContainer" class="steps-container"></div>
+        <div id="migrationConfig">
+            <div class="field-help">同一任务中的 SQL 会按从上到下的顺序逐条执行。全部 SQL 的结构校验通过后，才会写入第一批数据。</div>
+            <div id="stepsContainer" class="steps-container"></div>
+        </div>
+        <div id="archiveConfig" class="hidden">
+            <div class="archive-warning">
+                <strong>归档会删除源数据</strong>
+                <span>归档表必须已由 DBA 建好且与源表结构相同。请在停写或维护窗口执行，并先完成数据库备份。</span>
+            </div>
+            <article class="migration-step archive-main-table">
+                <div class="migration-step-head"><strong>主业务表</strong></div>
+                <div class="step-form-grid">
+                    <label>配置名称<input id="archiveMainName" type="text" value="主业务表"></label>
+                    <label>主业务源表<input id="archiveMainSourceTable" type="text" placeholder="表名或 模式名.表名"></label>
+                    <label>主业务归档表<input id="archiveMainTargetTable" type="text" placeholder="表名或 模式名.表名"></label>
+                    <label>递增唯一游标字段<input id="archiveMainCursorColumn" type="text" placeholder="例如 ID"></label>
+                </div>
+                <label>主表归档范围查询 SQL
+                    <textarea id="archiveMainSql" rows="7" spellcheck="false" placeholder="SELECT * FROM BUSINESS_MAIN WHERE CREATED_AT &lt; '2025-01-01'"></textarea>
+                </label>
+                <div class="field-help">查询必须返回主业务源表的全部字段，游标在本次归档范围内必须非空且唯一。工具以该查询结果作为主表归档范围。</div>
+            </article>
+            <div class="archive-child-heading">
+                <div><strong>关联从业务表</strong><span>每张从表可选择主表或另一张从表作为上级，形成无循环的有向关系。</span></div>
+                <button type="button" id="addArchiveChildButton" class="button secondary">＋ 添加子业务表</button>
+            </div>
+            <div id="archiveChildrenContainer" class="steps-container"></div>
+            <label class="archive-confirm"><input id="archiveConfirmDelete" type="checkbox"> 我已完成备份并确认：每批数据成功写入全部归档表后，删除对应的子表和主表源记录。</label>
+        </div>
         <div class="create-bar">
             <div>
                 <strong>创建后不会立即写库</strong>
-                <span>请在下方任务列表中再次点击“启动”，便于最后核对。</span>
+                <span id="createHint">请在下方任务列表中再次点击“启动”，便于最后核对。</span>
             </div>
             <button type="button" id="createTaskButton" class="button primary">创建迁移任务</button>
         </div>
@@ -172,6 +208,27 @@
             <textarea class="source-sql" rows="7" spellcheck="false" placeholder="SELECT ID, NAME, CREATED_AT FROM SOURCE_TABLE ORDER BY ID"></textarea>
         </label>
         <div class="field-help">SQL 只允许 SELECT/WITH。游标由页面配置为准，不要求数据库自增标记或数值类型；字段须在本次查询结果中非空、唯一，并能按数据库顺序持续递增。</div>
+    </article>
+</template>
+
+<template id="archiveChildTemplate">
+    <article class="migration-step archive-child-table">
+        <div class="migration-step-head">
+            <strong class="archive-child-title">子业务表 1</strong>
+            <button type="button" class="icon-button remove-archive-child" title="删除本张子业务表">×</button>
+        </div>
+        <div class="step-form-grid">
+            <label>配置名称<input class="archive-child-name" type="text" placeholder="例如：业务明细表"></label>
+            <label>节点标识<input class="archive-child-node-id" type="text" readonly></label>
+            <label>关联上级节点<select class="archive-child-parent-node"></select></label>
+            <label>子业务源表<input class="archive-child-source-table" type="text" placeholder="表名或 模式名.表名"></label>
+            <label>子业务归档表<input class="archive-child-target-table" type="text" placeholder="表名或 模式名.表名"></label>
+            <label>子表递增唯一游标字段<input class="archive-child-cursor-column" type="text" placeholder="例如 DETAIL_ID"></label>
+        </div>
+        <label>与上级表的关联字段映射
+            <input class="archive-child-relations" type="text" placeholder="例如 PARENT_ID=ID；复合关联用逗号分隔：TENANT_ID=TENANT_ID, PARENT_ID=ID">
+        </label>
+        <div class="field-help">等号左侧是本表字段，右侧是所选上级表字段。工具按有向关系逐层查询；归档表父节点先写、源表子节点先删。</div>
     </article>
 </template>
 

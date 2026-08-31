@@ -13,7 +13,7 @@
 
     <groupId>com.hundsun</groupId>
     <artifactId>light-db-migration</artifactId>
-    <version>1.1.1</version>
+    <version>1.2.0</version>
     <name>Light DB Migration</name>
     <description>面向现场实施人员的轻量级 MySQL/Oracle 数据迁移工具</description>
 

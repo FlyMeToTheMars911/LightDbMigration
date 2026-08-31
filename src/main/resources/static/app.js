@@ -1,6 +1,9 @@
 (function () {
     'use strict';
 
+    var ARCHIVE_MAIN_NODE_ID = 'MAIN';
+    var ARCHIVE_CHILD_NODE_PREFIX = 'CHILD_';
+
     var state = {
         tasks: [],
         selectedTaskId: null,
@@ -9,6 +12,7 @@
         selectedStructureSyncScript: '',
         lastLogSequence: 0,
         refreshing: false,
+        archiveNodeSequence: 0,
         toastTimer: null
     };
 
@@ -21,6 +25,8 @@
     document.addEventListener('DOMContentLoaded', function () {
         bindEvents();
         addMigrationStep();
+        addArchiveChild();
+        updateTaskType();
         checkServer();
         loadLastDatabaseConfig();
         refreshTasks();
@@ -35,11 +41,29 @@
             button.addEventListener('click', function () { testConnection(button.dataset.prefix, button); });
         });
         document.getElementById('addStepButton').addEventListener('click', addMigrationStep);
+        document.getElementById('taskType').addEventListener('change', updateTaskType);
+        document.getElementById('addArchiveChildButton').addEventListener('click', addArchiveChild);
         document.getElementById('stepsContainer').addEventListener('click', function (event) {
             if (event.target.classList.contains('remove-step')) {
                 removeMigrationStep(event.target.closest('.migration-step'));
             }
         });
+        document.getElementById('archiveChildrenContainer').addEventListener('click', function (event) {
+            if (event.target.classList.contains('remove-archive-child')) {
+                var removed = event.target.closest('.archive-child-table');
+                var removedNodeId = removed.dataset.nodeId;
+                var resetCount = resetRemovedArchiveParent(removedNodeId);
+                removed.remove();
+                renumberArchiveChildren();
+                if (resetCount > 0) {
+                    showToast('已删除节点，' + resetCount + ' 张下级从表的上级已重置为主表，请重新核对关联关系', true);
+                }
+            }
+        });
+        document.getElementById('archiveChildrenContainer').addEventListener('input', function (event) {
+            if (event.target.classList.contains('archive-child-name')) { refreshArchiveParentOptions(); }
+        });
+        document.getElementById('archiveMainName').addEventListener('input', refreshArchiveParentOptions);
         document.getElementById('createTaskButton').addEventListener('click', createTask);
         document.getElementById('saveCurrentConfigButton').addEventListener('click', saveCurrentDatabaseConfig);
         document.getElementById('clearSavedConfigButton').addEventListener('click', clearSavedDatabaseConfig);
@@ -70,6 +94,30 @@
         document.getElementById(prefix + 'DatabaseLabel').textContent = oracle ? '服务名 / SID' : '数据库名';
         document.getElementById(prefix + 'Database').placeholder = oracle ? '例如 ORCL' : '例如 business_db';
         document.getElementById(prefix + 'OracleModeWrap').classList.toggle('hidden', !oracle);
+    }
+
+    function updateTaskType() {
+        var archiveMode = value('taskType') === 'ARCHIVE';
+        document.getElementById('targetDatabaseCard').classList.toggle('hidden', archiveMode);
+        document.getElementById('databaseDirection').classList.toggle('hidden', archiveMode);
+        document.getElementById('databaseGrid').classList.toggle('archive-mode', archiveMode);
+        document.getElementById('migrationConfig').classList.toggle('hidden', archiveMode);
+        document.getElementById('archiveConfig').classList.toggle('hidden', !archiveMode);
+        document.getElementById('addStepButton').classList.toggle('hidden', archiveMode);
+        document.getElementById('databaseHeading').textContent = archiveMode ? '配置归档数据库' : '配置两端数据库';
+        document.getElementById('sourceDatabaseTitle').textContent = archiveMode ? '归档数据库' : '源数据库';
+        document.getElementById('configurationHeading').textContent = archiveMode ? '配置主表与关联子表' : '编排迁移 SQL';
+        document.getElementById('taskTypeHelp').textContent = archiveMode
+            ? '归档在同一个数据库连接内执行，归档表和源表可使用模式名.表名。'
+            : '数据迁移使用独立的源库和目标库连接。';
+        document.getElementById('createTaskButton').textContent = archiveMode ? '创建归档任务' : '创建迁移任务';
+        document.getElementById('createHint').textContent = archiveMode
+            ? '创建后请核对主表范围、全部关联字段和备份状态，再在任务列表中启动。'
+            : '请在下方任务列表中再次点击“启动”，便于最后核对。';
+        document.getElementById('taskName').placeholder = archiveMode ? '例如：历史业务数据归档' : '例如：客户基础数据迁移';
+        var batchSize = document.getElementById('batchSize');
+        batchSize.max = archiveMode ? '500' : '10000';
+        if (archiveMode && Number(batchSize.value) > 500) { batchSize.value = '500'; }
     }
 
     function databaseConfig(prefix) {
@@ -133,11 +181,16 @@
         var button = document.getElementById('saveCurrentConfigButton');
         setBusy(button, true, '保存中…');
         try {
+            var sourceConfig = databaseConfig('source');
+            var archiveMode = value('taskType') === 'ARCHIVE';
             await api('/api/config/last', {
                 method: 'POST',
-                body: JSON.stringify({ source: databaseConfig('source'), target: databaseConfig('target') })
+                body: JSON.stringify({
+                    source: sourceConfig,
+                    target: archiveMode ? Object.assign({}, sourceConfig) : databaseConfig('target')
+                })
             });
-            showToast('两端数据库配置已加密保存，服务重启后会自动回填');
+            showToast(archiveMode ? '归档数据库配置已加密保存' : '两端数据库配置已加密保存，服务重启后会自动回填');
         } catch (error) {
             showToast(error.message, true);
         } finally {
@@ -190,6 +243,68 @@
         });
     }
 
+    function addArchiveChild() {
+        var template = document.getElementById('archiveChildTemplate');
+        var fragment = template.content.cloneNode(true);
+        var childTable = fragment.querySelector('.archive-child-table');
+        state.archiveNodeSequence++;
+        childTable.dataset.nodeId = ARCHIVE_CHILD_NODE_PREFIX + state.archiveNodeSequence;
+        childTable.querySelector('.archive-child-node-id').value = childTable.dataset.nodeId;
+        document.getElementById('archiveChildrenContainer').appendChild(fragment);
+        renumberArchiveChildren();
+    }
+
+    function renumberArchiveChildren() {
+        document.querySelectorAll('.archive-child-table').forEach(function (element, index) {
+            element.querySelector('.archive-child-title').textContent = '子业务表 ' + (index + 1);
+            var name = element.querySelector('.archive-child-name');
+            if (!name.value) { name.placeholder = '子业务表 ' + (index + 1); }
+        });
+        refreshArchiveParentOptions();
+    }
+
+    function refreshArchiveParentOptions() {
+        var childTables = Array.prototype.slice.call(document.querySelectorAll('.archive-child-table'));
+        var nodes = [{ id: ARCHIVE_MAIN_NODE_ID, name: value('archiveMainName') || '主业务表' }];
+        childTables.forEach(function (element, index) {
+            nodes.push({
+                id: element.dataset.nodeId,
+                name: element.querySelector('.archive-child-name').value.trim() || ('子业务表 ' + (index + 1))
+            });
+        });
+        childTables.forEach(function (element) {
+            var select = element.querySelector('.archive-child-parent-node');
+            var current = select.value || ARCHIVE_MAIN_NODE_ID;
+            select.innerHTML = '';
+            nodes.forEach(function (node) {
+                if (node.id === element.dataset.nodeId) { return; }
+                var option = document.createElement('option');
+                option.value = node.id;
+                option.textContent = node.name + '（' + node.id + '）';
+                select.appendChild(option);
+            });
+            select.value = Array.prototype.some.call(select.options, function (option) {
+                return option.value === current;
+            }) ? current : ARCHIVE_MAIN_NODE_ID;
+        });
+    }
+
+    function resetRemovedArchiveParent(removedNodeId) {
+        var resetCount = 0;
+        document.querySelectorAll('.archive-child-parent-node').forEach(function (select) {
+            if (select.value === removedNodeId) {
+                select.dataset.resetToMain = 'true';
+                resetCount++;
+            }
+        });
+        refreshArchiveParentOptions();
+        document.querySelectorAll('.archive-child-parent-node[data-reset-to-main]').forEach(function (select) {
+            select.value = ARCHIVE_MAIN_NODE_ID;
+            delete select.dataset.resetToMain;
+        });
+        return resetCount;
+    }
+
     function collectSteps() {
         return Array.prototype.map.call(document.querySelectorAll('.migration-step'), function (element, index) {
             return {
@@ -202,19 +317,64 @@
         });
     }
 
+    function collectArchiveConfig() {
+        return {
+            confirmSourceDelete: document.getElementById('archiveConfirmDelete').checked,
+            mainTable: {
+                name: value('archiveMainName') || '主业务表',
+                nodeId: ARCHIVE_MAIN_NODE_ID,
+                parentNodeId: null,
+                sourceTable: value('archiveMainSourceTable'),
+                targetTable: value('archiveMainTargetTable'),
+                cursorColumn: value('archiveMainCursorColumn'),
+                sourceSql: value('archiveMainSql'),
+                relations: []
+            },
+            childTables: Array.prototype.map.call(document.querySelectorAll('.archive-child-table'),
+                function (element, index) {
+                    return {
+                        name: element.querySelector('.archive-child-name').value.trim() || ('子业务表 ' + (index + 1)),
+                        nodeId: element.dataset.nodeId,
+                        parentNodeId: element.querySelector('.archive-child-parent-node').value,
+                        sourceTable: element.querySelector('.archive-child-source-table').value.trim(),
+                        targetTable: element.querySelector('.archive-child-target-table').value.trim(),
+                        cursorColumn: element.querySelector('.archive-child-cursor-column').value.trim(),
+                        relations: parseArchiveRelations(element.querySelector('.archive-child-relations').value,
+                            index + 1)
+                    };
+                })
+        };
+    }
+
+    function parseArchiveRelations(input, childIndex) {
+        var text = String(input || '').trim();
+        if (!text) { return []; }
+        return text.split(/[,，;；]+/).map(function (mapping) {
+            var parts = mapping.split('=');
+            if (parts.length !== 2 || !parts[0].trim() || !parts[1].trim()) {
+                throw new Error('子业务表 ' + childIndex + ' 的关联字段格式不正确，请使用 子表字段=上级表字段');
+            }
+            return { childColumn: parts[0].trim(), mainColumn: parts[1].trim() };
+        });
+    }
+
     async function createTask() {
         var button = document.getElementById('createTaskButton');
-        var payload = {
-            name: value('taskName'),
-            batchSize: numberValue('batchSize'),
-            source: databaseConfig('source'),
-            target: databaseConfig('target'),
-            steps: collectSteps()
-        };
         setBusy(button, true, '正在创建…');
         try {
+            var taskType = value('taskType');
+            var sourceConfig = databaseConfig('source');
+            var payload = {
+                taskType: taskType,
+                name: value('taskName'),
+                batchSize: numberValue('batchSize'),
+                source: sourceConfig,
+                target: taskType === 'ARCHIVE' ? Object.assign({}, sourceConfig) : databaseConfig('target'),
+                steps: taskType === 'ARCHIVE' ? [] : collectSteps(),
+                archive: taskType === 'ARCHIVE' ? collectArchiveConfig() : null
+            };
             var result = await api('/api/tasks', { method: 'POST', body: JSON.stringify(payload) });
-            showToast('任务已创建，请在任务列表核对后启动');
+            showToast(taskType === 'ARCHIVE' ? '归档任务已创建，请核对后再启动' : '任务已创建，请在任务列表核对后启动');
             state.selectedTaskId = result.data.id;
             state.selectedLogs = result.data.logs || [];
             state.lastLogSequence = result.data.lastLogSequence || 0;
@@ -256,19 +416,31 @@
         var selected = task.id === state.selectedTaskId ? ' selected' : '';
         var actions = taskActions(task);
         var stepHtml = (task.steps || []).map(function (step) {
+            var archiveStep = task.taskType === 'ARCHIVE';
+            var counts = archiveStep
+                ? '已归档 ' + formatNumber(step.insertedRows) + '，已删除源记录 ' + formatNumber(step.deletedRows)
+                : '写入 ' + formatNumber(step.insertedRows) + '，跳过 ' + formatNumber(step.ignoredRows);
+            var graph = archiveStep ? '<br>节点 ' + escapeHtml(step.nodeId || ARCHIVE_MAIN_NODE_ID) + '，上级 '
+                + escapeHtml(step.parentNodeId || '-') : '';
             return '<div class="step-progress-item"><strong>' + escapeHtml(step.name) + ' · '
                 + escapeHtml(statusName(step.status)) + '</strong>'
-                + escapeHtml(step.targetTable || '') + '<br>已处理 ' + formatNumber(step.processedRows)
-                + ' / ' + formatNumber(step.totalRows) + '，写入 ' + formatNumber(step.insertedRows)
-                + '，跳过 ' + formatNumber(step.ignoredRows) + '</div>';
+                + (archiveStep ? escapeHtml((step.sourceTable || '') + ' → ' + (step.targetTable || ''))
+                    : escapeHtml(step.targetTable || ''))
+                + graph
+                + '<br>已处理 ' + formatNumber(step.processedRows) + ' / ' + formatNumber(step.totalRows)
+                + '，' + counts + '</div>';
         }).join('');
+        var archiveTask = task.taskType === 'ARCHIVE';
+        var targetMeta = archiveTask ? '<span>方式：同库归档</span>'
+            : '<span>目标：' + escapeHtml(task.target.type + ' ' + task.target.endpoint) + '</span>';
         return '<article class="task-card' + selected + '" data-task-id="' + escapeHtml(task.id) + '">'
             + '<div class="task-head"><div><div class="task-name">' + escapeHtml(task.name)
-            + '<span class="status-badge ' + escapeHtml(task.status) + '">' + escapeHtml(statusName(task.status))
+            + '<span class="task-type-badge ' + escapeHtml(task.taskType || 'MIGRATION') + '">'
+            + (archiveTask ? '归档' : '迁移') + '</span><span class="status-badge ' + escapeHtml(task.status) + '">'
+            + escapeHtml(task.status === 'RUNNING' && archiveTask ? '归档中' : statusName(task.status))
             + '</span></div><div class="task-meta"><span>ID：<span class="task-id">' + escapeHtml(task.id)
             + '</span></span><span>源：' + escapeHtml(task.source.type + ' ' + task.source.endpoint)
-            + '</span><span>目标：' + escapeHtml(task.target.type + ' ' + task.target.endpoint)
-            + '</span><span>批次：' + formatNumber(task.batchSize) + '</span></div></div>'
+            + '</span>' + targetMeta + '<span>批次：' + formatNumber(task.batchSize) + '</span></div></div>'
             + '<div class="task-actions">' + actions + '</div></div>'
             + '<div class="progress-row"><div class="progress-track"><div class="progress-fill" style="width:'
             + Math.max(0, Math.min(100, task.percent || 0)) + '%"></div></div><div class="progress-text">'
@@ -304,6 +476,11 @@
         var action = button.dataset.action;
         if (action === 'logs') {
             openLogs(id);
+            return;
+        }
+        var selectedTask = state.tasks.filter(function (task) { return task.id === id; })[0];
+        if (action === 'start' && selectedTask && selectedTask.taskType === 'ARCHIVE'
+            && !window.confirm('归档会永久删除已成功写入归档表的源记录。请确认已完成备份、已核对主表范围及全部子表关联，是否启动？')) {
             return;
         }
         if (action === 'delete' && !window.confirm('确认从页面中清除该任务记录吗？这不会删除数据库中的数据。')) {

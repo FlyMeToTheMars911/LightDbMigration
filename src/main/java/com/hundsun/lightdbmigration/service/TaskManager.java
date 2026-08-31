@@ -1,6 +1,9 @@
 package com.hundsun.lightdbmigration.service;
 
 import com.hundsun.lightdbmigration.model.CreateTaskRequest;
+import com.hundsun.lightdbmigration.model.ArchiveRelationRequest;
+import com.hundsun.lightdbmigration.model.ArchiveRequest;
+import com.hundsun.lightdbmigration.model.ArchiveTableRequest;
 import com.hundsun.lightdbmigration.model.LastDatabaseConfig;
 import com.hundsun.lightdbmigration.model.MigrationStepRequest;
 import com.hundsun.lightdbmigration.model.TaskStatus;
@@ -17,9 +20,11 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -34,11 +39,14 @@ public class TaskManager implements DisposableBean {
 
     private final Map<String, MigrationTask> tasks = new ConcurrentHashMap<>();
     private final MigrationEngine migrationEngine;
+    private final ArchiveEngine archiveEngine;
     private final LastDatabaseConfigStore lastDatabaseConfigStore;
     private final ExecutorService executorService;
 
-    public TaskManager(MigrationEngine migrationEngine, LastDatabaseConfigStore lastDatabaseConfigStore) {
+    public TaskManager(MigrationEngine migrationEngine, ArchiveEngine archiveEngine,
+        LastDatabaseConfigStore lastDatabaseConfigStore) {
         this.migrationEngine = migrationEngine;
+        this.archiveEngine = archiveEngine;
         this.lastDatabaseConfigStore = lastDatabaseConfigStore;
         this.executorService = Executors.newFixedThreadPool(MigrationConstants.EXECUTOR_SIZE,
             new MigrationThreadFactory());
@@ -123,7 +131,11 @@ public class TaskManager implements DisposableBean {
             executorService.submit(new Runnable() {
                 @Override
                 public void run() {
-                    migrationEngine.execute(task);
+                    if (MigrationConstants.TASK_TYPE_ARCHIVE.equals(task.getRequest().getTaskType())) {
+                        archiveEngine.execute(task);
+                    } else {
+                        migrationEngine.execute(task);
+                    }
                 }
             });
         }
@@ -160,7 +172,7 @@ public class TaskManager implements DisposableBean {
     public Map<String, Object> systemInfo() {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("name", "Light DB Migration");
-        result.put("version", "1.1.1");
+        result.put("version", "1.2.0");
         result.put("supportedDatabases", new String[] {MigrationConstants.DB_MYSQL, MigrationConstants.DB_ORACLE});
         result.put("maxConcurrentTasks", MigrationConstants.EXECUTOR_SIZE);
         result.put("taskDataStorage", "MEMORY_ONLY");
@@ -171,6 +183,12 @@ public class TaskManager implements DisposableBean {
     private void validateRequest(CreateTaskRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("任务配置不能为空");
+        }
+        String taskType = normalizeTaskType(request.getTaskType());
+        request.setTaskType(taskType);
+        if (MigrationConstants.TASK_TYPE_ARCHIVE.equals(taskType)) {
+            validateArchiveRequest(request);
+            return;
         }
         DatabaseSupport.validate(request.getSource());
         DatabaseSupport.validate(request.getTarget());
@@ -216,6 +234,179 @@ public class TaskManager implements DisposableBean {
                 step.setInsertMode(insertMode);
             }
         }
+    }
+
+    private void validateArchiveRequest(CreateTaskRequest request) {
+        DatabaseSupport.validate(request.getSource());
+        request.setTarget(request.getSource());
+        if (request.getBatchSize() == null) {
+            request.setBatchSize(MigrationConstants.DEFAULT_BATCH_SIZE);
+        }
+        if (request.getBatchSize() < MigrationConstants.MIN_BATCH_SIZE
+            || request.getBatchSize() > MigrationConstants.MAX_ARCHIVE_BATCH_SIZE) {
+            throw new IllegalArgumentException("归档批次大小必须在 " + MigrationConstants.MIN_BATCH_SIZE + " 到 "
+                + MigrationConstants.MAX_ARCHIVE_BATCH_SIZE + " 之间");
+        }
+        if (isBlank(request.getName())) {
+            request.setName("归档任务-" + System.currentTimeMillis());
+        } else {
+            request.setName(request.getName().trim());
+        }
+        ArchiveRequest archive = request.getArchive();
+        if (archive == null) {
+            throw new IllegalArgumentException("归档配置不能为空");
+        }
+        if (!Boolean.TRUE.equals(archive.getConfirmSourceDelete())) {
+            throw new IllegalArgumentException("必须明确勾选确认：归档成功后删除源表数据");
+        }
+        ArchiveTableRequest mainTable = archive.getMainTable();
+        if (mainTable == null) {
+            throw new IllegalArgumentException("主业务表归档配置不能为空");
+        }
+        normalizeArchiveTable(mainTable, "主业务表", true);
+        mainTable.setNodeId(MigrationConstants.ARCHIVE_MAIN_NODE_ID);
+        mainTable.setParentNodeId(null);
+        List<ArchiveTableRequest> childTables = archive.getChildTables();
+        if (childTables == null) {
+            childTables = new ArrayList<>();
+            archive.setChildTables(childTables);
+        }
+        if (childTables.size() + 1 > MigrationConstants.MAX_STEPS) {
+            throw new IllegalArgumentException("单个任务最多支持 " + MigrationConstants.MAX_STEPS + " 张归档表");
+        }
+        Set<String> sourceTables = new LinkedHashSet<>();
+        Set<String> targetTables = new LinkedHashSet<>();
+        Map<String, ArchiveTableRequest> childByNodeId = new LinkedHashMap<>();
+        sourceTables.add(normalizeTableIdentity(mainTable.getSourceTable()));
+        targetTables.add(normalizeTableIdentity(mainTable.getTargetTable()));
+        for (int i = 0; i < childTables.size(); i++) {
+            ArchiveTableRequest childTable = childTables.get(i);
+            if (childTable == null) {
+                throw new IllegalArgumentException("第 " + (i + 1) + " 张子业务表配置不能为空");
+            }
+            String label = "第 " + (i + 1) + " 张子业务表";
+            normalizeArchiveTable(childTable, label, false);
+            String nodeId = isBlank(childTable.getNodeId()) ? MigrationConstants.ARCHIVE_CHILD_NODE_PREFIX + (i + 1)
+                : childTable.getNodeId().trim().toUpperCase(Locale.ROOT);
+            nodeId = SqlSupport.normalizeColumnName(nodeId, label + "节点标识").toUpperCase(Locale.ROOT);
+            if (MigrationConstants.ARCHIVE_MAIN_NODE_ID.equals(nodeId)) {
+                throw new IllegalArgumentException(label + "节点标识不能使用保留值 MAIN");
+            }
+            if (childByNodeId.put(nodeId, childTable) != null) {
+                throw new IllegalArgumentException("从表节点标识重复：" + nodeId);
+            }
+            childTable.setNodeId(nodeId);
+            String parentNodeId = isBlank(childTable.getParentNodeId())
+                ? MigrationConstants.ARCHIVE_MAIN_NODE_ID
+                : childTable.getParentNodeId().trim().toUpperCase(Locale.ROOT);
+            childTable.setParentNodeId(SqlSupport.normalizeColumnName(parentNodeId, label + "上级节点标识")
+                .toUpperCase(Locale.ROOT));
+            String sourceIdentity = normalizeTableIdentity(childTable.getSourceTable());
+            String targetIdentity = normalizeTableIdentity(childTable.getTargetTable());
+            if (!sourceTables.add(sourceIdentity)) {
+                throw new IllegalArgumentException(label + "的源表重复配置：" + childTable.getSourceTable());
+            }
+            if (!targetTables.add(targetIdentity)) {
+                throw new IllegalArgumentException(label + "的归档表重复配置：" + childTable.getTargetTable());
+            }
+        }
+        Set<String> overlap = new LinkedHashSet<>(sourceTables);
+        overlap.retainAll(targetTables);
+        if (!overlap.isEmpty()) {
+            throw new IllegalArgumentException("源表不能同时作为任一归档目标表：" + overlap.iterator().next());
+        }
+        archive.setChildTables(sortArchiveChildren(childTables, childByNodeId));
+        request.setSteps(Collections.<MigrationStepRequest>emptyList());
+    }
+
+    private void normalizeArchiveTable(ArchiveTableRequest table, String defaultName, boolean mainTable) {
+        if (isBlank(table.getName())) {
+            table.setName(defaultName);
+        } else {
+            table.setName(table.getName().trim());
+        }
+        table.setSourceTable(SqlSupport.parseTableName(table.getSourceTable(), defaultName + "源表").toSql());
+        table.setTargetTable(SqlSupport.parseTableName(table.getTargetTable(), defaultName + "归档表").toSql());
+        if (normalizeTableIdentity(table.getSourceTable()).equals(normalizeTableIdentity(table.getTargetTable()))) {
+            throw new IllegalArgumentException(defaultName + "的源表与归档表不能相同");
+        }
+        table.setCursorColumn(SqlSupport.normalizeColumnName(table.getCursorColumn(), defaultName + "唯一游标字段"));
+        if (mainTable) {
+            table.setSourceSql(SqlSupport.normalizeSourceQuery(table.getSourceSql()));
+            table.setRelations(Collections.<ArchiveRelationRequest>emptyList());
+            return;
+        }
+        table.setSourceSql(null);
+        List<ArchiveRelationRequest> relations = table.getRelations();
+        if (relations == null || relations.isEmpty()) {
+            throw new IllegalArgumentException(defaultName + "至少需要一组与上级表的关联字段");
+        }
+        if (relations.size() > MigrationConstants.MAX_ARCHIVE_RELATIONS) {
+            throw new IllegalArgumentException(defaultName + "最多支持 " + MigrationConstants.MAX_ARCHIVE_RELATIONS
+                + " 组关联字段");
+        }
+        Set<String> childColumns = new LinkedHashSet<>();
+        for (int i = 0; i < relations.size(); i++) {
+            ArchiveRelationRequest relation = relations.get(i);
+            if (relation == null) {
+                throw new IllegalArgumentException(defaultName + "第 " + (i + 1) + " 组关联字段不能为空");
+            }
+            relation.setChildColumn(SqlSupport.normalizeColumnName(relation.getChildColumn(),
+                defaultName + "子表关联字段"));
+            relation.setMainColumn(SqlSupport.normalizeColumnName(relation.getMainColumn(),
+                defaultName + "上级表关联字段"));
+            if (!childColumns.add(relation.getChildColumn().toUpperCase(Locale.ROOT))) {
+                throw new IllegalArgumentException(defaultName + "重复配置子表关联字段：" + relation.getChildColumn());
+            }
+        }
+    }
+
+    private List<ArchiveTableRequest> sortArchiveChildren(List<ArchiveTableRequest> childTables,
+        Map<String, ArchiveTableRequest> childByNodeId) {
+        List<ArchiveTableRequest> sorted = new ArrayList<>();
+        Set<String> visiting = new LinkedHashSet<>();
+        Set<String> visited = new LinkedHashSet<>();
+        for (ArchiveTableRequest childTable : childTables) {
+            visitArchiveNode(childTable, childByNodeId, visiting, visited, sorted);
+        }
+        return sorted;
+    }
+
+    private void visitArchiveNode(ArchiveTableRequest childTable, Map<String, ArchiveTableRequest> childByNodeId,
+        Set<String> visiting, Set<String> visited, List<ArchiveTableRequest> sorted) {
+        String nodeId = childTable.getNodeId();
+        if (visited.contains(nodeId)) {
+            return;
+        }
+        if (!visiting.add(nodeId)) {
+            throw new IllegalArgumentException("归档从表关系存在循环，涉及节点：" + nodeId);
+        }
+        String parentNodeId = childTable.getParentNodeId();
+        if (!MigrationConstants.ARCHIVE_MAIN_NODE_ID.equals(parentNodeId)) {
+            ArchiveTableRequest parent = childByNodeId.get(parentNodeId);
+            if (parent == null) {
+                throw new IllegalArgumentException("归档从表节点 " + nodeId + " 的上级节点不存在："
+                    + parentNodeId);
+            }
+            visitArchiveNode(parent, childByNodeId, visiting, visited, sorted);
+        }
+        visiting.remove(nodeId);
+        visited.add(nodeId);
+        sorted.add(childTable);
+    }
+
+    private String normalizeTaskType(String taskType) {
+        String normalized = isBlank(taskType) ? MigrationConstants.TASK_TYPE_MIGRATION
+            : taskType.trim().toUpperCase(Locale.ROOT);
+        if (!MigrationConstants.TASK_TYPE_MIGRATION.equals(normalized)
+            && !MigrationConstants.TASK_TYPE_ARCHIVE.equals(normalized)) {
+            throw new IllegalArgumentException("任务类型只支持 MIGRATION 或 ARCHIVE");
+        }
+        return normalized;
+    }
+
+    private String normalizeTableIdentity(String tableName) {
+        return tableName == null ? "" : tableName.trim().toUpperCase(Locale.ROOT);
     }
 
     private MigrationTask requireTask(String id) {

@@ -1,6 +1,7 @@
 package com.hundsun.lightdbmigration.service;
 
 import com.hundsun.lightdbmigration.model.CreateTaskRequest;
+import com.hundsun.lightdbmigration.model.ArchiveTableRequest;
 import com.hundsun.lightdbmigration.model.MigrationStepRequest;
 import com.hundsun.lightdbmigration.model.StepProgress;
 import com.hundsun.lightdbmigration.model.TaskLog;
@@ -55,11 +56,21 @@ public class MigrationTask {
     public MigrationTask(String id, CreateTaskRequest request) {
         this.id = id;
         this.request = request;
-        List<MigrationStepRequest> steps = request.getSteps();
-        for (int i = 0; i < steps.size(); i++) {
-            stepProgressList.add(new StepProgress(i + 1, steps.get(i)));
+        if (MigrationConstants.TASK_TYPE_ARCHIVE.equals(request.getTaskType())) {
+            ArchiveTableRequest mainTable = request.getArchive().getMainTable();
+            stepProgressList.add(new StepProgress(1, mainTable));
+            List<ArchiveTableRequest> childTables = request.getArchive().getChildTables();
+            for (int i = 0; i < childTables.size(); i++) {
+                stepProgressList.add(new StepProgress(i + 2, childTables.get(i)));
+            }
+            info("归档任务已创建，共 " + stepProgressList.size() + " 张表；启动后将按批次写入归档表并删除源数据");
+        } else {
+            List<MigrationStepRequest> steps = request.getSteps();
+            for (int i = 0; i < steps.size(); i++) {
+                stepProgressList.add(new StepProgress(i + 1, steps.get(i)));
+            }
+            info("任务已创建，共 " + steps.size() + " 个迁移步骤");
         }
-        info("任务已创建，共 " + steps.size() + " 个迁移步骤");
     }
 
     public String getId() {
@@ -98,9 +109,11 @@ public class MigrationTask {
 
     public void markSucceeded() {
         status = TaskStatus.SUCCEEDED;
-        currentMessage = "迁移完成";
+        boolean archiveTask = MigrationConstants.TASK_TYPE_ARCHIVE.equals(request.getTaskType());
+        currentMessage = archiveTask ? "归档完成" : "迁移完成";
         finishedAt = LocalDateTime.now().format(FORMATTER);
-        info("全部迁移步骤执行完成");
+        info(archiveTask ? "主表及全部子表归档完成，已归档数据对应的源记录已删除"
+            : "全部迁移步骤执行完成");
     }
 
     public void markFailed(String message) {
@@ -189,6 +202,12 @@ public class MigrationTask {
         }
     }
 
+    public void stopCheckpoint() throws StopRequestedException {
+        if (stopRequested) {
+            throw new StopRequestedException();
+        }
+    }
+
     public void setCurrentStatement(Statement statement) {
         if (statement == null) {
             return;
@@ -229,6 +248,11 @@ public class MigrationTask {
         stepProgressList.get(stepIndex).addBatch(processed, inserted, ignored);
     }
 
+    public synchronized void addArchiveBatch(int stepIndex, long processed, long inserted, long deleted) {
+        processedRows += processed;
+        stepProgressList.get(stepIndex).addArchiveBatch(processed, inserted, deleted);
+    }
+
     public boolean isStopRequested() {
         return stopRequested;
     }
@@ -238,8 +262,12 @@ public class MigrationTask {
     }
 
     public void clearPasswords() {
-        request.getSource().clearPassword();
-        request.getTarget().clearPassword();
+        if (request.getSource() != null) {
+            request.getSource().clearPassword();
+        }
+        if (request.getTarget() != null && request.getTarget() != request.getSource()) {
+            request.getTarget().clearPassword();
+        }
     }
 
     public void info(String message) {
@@ -261,6 +289,7 @@ public class MigrationTask {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("id", id);
         result.put("name", request.getName());
+        result.put("taskType", request.getTaskType());
         result.put("status", status.name());
         result.put("createdAt", createdAt);
         result.put("startedAt", startedAt);
