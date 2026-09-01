@@ -25,12 +25,14 @@
             <outputDirectory>/</outputDirectory>
             <destName>start.bat</destName>
             <fileMode>0644</fileMode>
+            <lineEnding>crlf</lineEnding>
         </file>
         <file>
             <source>${project.basedir}/start.sh</source>
             <outputDirectory>/</outputDirectory>
             <destName>start.sh</destName>
             <fileMode>0755</fileMode>
+            <lineEnding>lf</lineEnding>
         </file>
     </files>
     <fileSets>
