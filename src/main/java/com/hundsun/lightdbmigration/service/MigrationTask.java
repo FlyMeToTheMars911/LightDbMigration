@@ -57,13 +57,16 @@ public class MigrationTask {
         this.id = id;
         this.request = request;
         if (MigrationConstants.TASK_TYPE_ARCHIVE.equals(request.getTaskType())) {
-            ArchiveTableRequest mainTable = request.getArchive().getMainTable();
-            stepProgressList.add(new StepProgress(1, mainTable));
+            List<ArchiveTableRequest> mainTables = request.getArchive().getMainTables();
+            for (int i = 0; i < mainTables.size(); i++) {
+                stepProgressList.add(new StepProgress(i + 1, mainTables.get(i)));
+            }
             List<ArchiveTableRequest> childTables = request.getArchive().getChildTables();
             for (int i = 0; i < childTables.size(); i++) {
-                stepProgressList.add(new StepProgress(i + 2, childTables.get(i)));
+                stepProgressList.add(new StepProgress(mainTables.size() + i + 1, childTables.get(i)));
             }
-            info("归档任务已创建，共 " + stepProgressList.size() + " 张表；启动后将按批次写入归档表并删除源数据");
+            info("归档任务已创建，共 " + mainTables.size() + " 张主业务表、" + childTables.size()
+                + " 张子业务表；启动后将逐个主表按批次写入归档表并删除源数据");
         } else {
             List<MigrationStepRequest> steps = request.getSteps();
             for (int i = 0; i < steps.size(); i++) {
@@ -112,7 +115,7 @@ public class MigrationTask {
         boolean archiveTask = MigrationConstants.TASK_TYPE_ARCHIVE.equals(request.getTaskType());
         currentMessage = archiveTask ? "归档完成" : "迁移完成";
         finishedAt = LocalDateTime.now().format(FORMATTER);
-        info(archiveTask ? "主表及全部子表归档完成，已归档数据对应的源记录已删除"
+        info(archiveTask ? "全部主表及子表归档完成，已归档数据对应的源记录已删除"
             : "全部迁移步骤执行完成");
     }
 
@@ -283,6 +286,10 @@ public class MigrationTask {
     public void error(String message) {
         appendLog(LOG_ERROR, message);
         LOGGER.error("[taskId={}] {}", id, message);
+    }
+
+    void backendSql(String message) {
+        LOGGER.info("[taskId={}] {}", id, message);
     }
 
     public Map<String, Object> snapshot(boolean includeLogs, long afterSequence) {

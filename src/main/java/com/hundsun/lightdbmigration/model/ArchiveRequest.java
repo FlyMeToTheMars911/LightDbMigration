@@ -6,6 +6,7 @@ public class ArchiveRequest {
 
     private Boolean confirmSourceDelete;
     private ArchiveTableRequest mainTable;
+    private List<ArchiveTableRequest> mainTables;
     private List<ArchiveTableRequest> childTables;
 
     public Boolean getConfirmSourceDelete() {
@@ -22,6 +23,14 @@ public class ArchiveRequest {
 
     public void setMainTable(ArchiveTableRequest mainTable) {
         this.mainTable = mainTable;
+    }
+
+    public List<ArchiveTableRequest> getMainTables() {
+        return mainTables;
+    }
+
+    public void setMainTables(List<ArchiveTableRequest> mainTables) {
+        this.mainTables = mainTables;
     }
 
     public List<ArchiveTableRequest> getChildTables() {

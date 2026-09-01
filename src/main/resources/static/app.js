@@ -2,7 +2,11 @@
     'use strict';
 
     var ARCHIVE_MAIN_NODE_ID = 'MAIN';
+    var ARCHIVE_MAIN_NODE_PREFIX = 'MAIN_';
     var ARCHIVE_CHILD_NODE_PREFIX = 'CHILD_';
+    var MIN_ARCHIVE_MAIN_TABLES = 1;
+    var MIN_MIGRATION_STEPS = 1;
+    var MIGRATION_STEP_SELECTOR = '#stepsContainer .migration-step';
 
     var state = {
         tasks: [],
@@ -12,6 +16,7 @@
         selectedStructureSyncScript: '',
         lastLogSequence: 0,
         refreshing: false,
+        archiveMainNodeSequence: 0,
         archiveNodeSequence: 0,
         toastTimer: null
     };
@@ -25,6 +30,7 @@
     document.addEventListener('DOMContentLoaded', function () {
         bindEvents();
         addMigrationStep();
+        addArchiveMain();
         addArchiveChild();
         updateTaskType();
         checkServer();
@@ -42,11 +48,20 @@
         });
         document.getElementById('addStepButton').addEventListener('click', addMigrationStep);
         document.getElementById('taskType').addEventListener('change', updateTaskType);
+        document.getElementById('addArchiveMainButton').addEventListener('click', addArchiveMain);
         document.getElementById('addArchiveChildButton').addEventListener('click', addArchiveChild);
         document.getElementById('stepsContainer').addEventListener('click', function (event) {
             if (event.target.classList.contains('remove-step')) {
                 removeMigrationStep(event.target.closest('.migration-step'));
             }
+        });
+        document.getElementById('archiveMainsContainer').addEventListener('click', function (event) {
+            if (event.target.classList.contains('remove-archive-main')) {
+                removeArchiveMain(event.target.closest('.archive-main-table'));
+            }
+        });
+        document.getElementById('archiveMainsContainer').addEventListener('input', function (event) {
+            if (event.target.classList.contains('archive-main-name')) { refreshArchiveParentOptions(); }
         });
         document.getElementById('archiveChildrenContainer').addEventListener('click', function (event) {
             if (event.target.classList.contains('remove-archive-child')) {
@@ -63,7 +78,6 @@
         document.getElementById('archiveChildrenContainer').addEventListener('input', function (event) {
             if (event.target.classList.contains('archive-child-name')) { refreshArchiveParentOptions(); }
         });
-        document.getElementById('archiveMainName').addEventListener('input', refreshArchiveParentOptions);
         document.getElementById('createTaskButton').addEventListener('click', createTask);
         document.getElementById('saveCurrentConfigButton').addEventListener('click', saveCurrentDatabaseConfig);
         document.getElementById('clearSavedConfigButton').addEventListener('click', clearSavedDatabaseConfig);
@@ -227,7 +241,7 @@
 
     function removeMigrationStep(stepElement) {
         var container = document.getElementById('stepsContainer');
-        if (container.children.length <= 1) {
+        if (container.children.length <= MIN_MIGRATION_STEPS) {
             showToast('至少保留一条迁移 SQL', true);
             return;
         }
@@ -236,7 +250,7 @@
     }
 
     function renumberSteps() {
-        document.querySelectorAll('.migration-step').forEach(function (element, index) {
+        document.querySelectorAll(MIGRATION_STEP_SELECTOR).forEach(function (element, index) {
             element.querySelector('.migration-step-title').textContent = 'SQL ' + (index + 1);
             var name = element.querySelector('.step-name');
             if (!name.value) { name.placeholder = '步骤 ' + (index + 1); }
@@ -254,6 +268,44 @@
         renumberArchiveChildren();
     }
 
+    function addArchiveMain() {
+        var template = document.getElementById('archiveMainTemplate');
+        var fragment = template.content.cloneNode(true);
+        var mainTable = fragment.querySelector('.archive-main-table');
+        state.archiveMainNodeSequence++;
+        mainTable.dataset.nodeId = ARCHIVE_MAIN_NODE_PREFIX + state.archiveMainNodeSequence;
+        mainTable.querySelector('.archive-main-node-id').value = mainTable.dataset.nodeId;
+        document.getElementById('archiveMainsContainer').appendChild(fragment);
+        renumberArchiveMains();
+    }
+
+    function removeArchiveMain(mainElement) {
+        var container = document.getElementById('archiveMainsContainer');
+        if (container.children.length <= MIN_ARCHIVE_MAIN_TABLES) {
+            showToast('至少保留一张主业务表', true);
+            return;
+        }
+        var removedNodeId = mainElement.dataset.nodeId;
+        document.querySelectorAll('.archive-child-parent-node').forEach(function (select) {
+            if (select.value === removedNodeId) { select.dataset.resetToMain = 'true'; }
+        });
+        mainElement.remove();
+        renumberArchiveMains();
+        var resetCount = applyRemovedArchiveParentReset();
+        if (resetCount > 0) {
+            showToast('已删除主表节点，' + resetCount + ' 张直属从表已改挂到第一张主表，请重新核对关联关系', true);
+        }
+    }
+
+    function renumberArchiveMains() {
+        document.querySelectorAll('.archive-main-table').forEach(function (element, index) {
+            element.querySelector('.archive-main-title').textContent = '主业务表 ' + (index + 1);
+            var name = element.querySelector('.archive-main-name');
+            if (!name.value) { name.placeholder = '主业务表 ' + (index + 1); }
+        });
+        refreshArchiveParentOptions();
+    }
+
     function renumberArchiveChildren() {
         document.querySelectorAll('.archive-child-table').forEach(function (element, index) {
             element.querySelector('.archive-child-title').textContent = '子业务表 ' + (index + 1);
@@ -265,7 +317,13 @@
 
     function refreshArchiveParentOptions() {
         var childTables = Array.prototype.slice.call(document.querySelectorAll('.archive-child-table'));
-        var nodes = [{ id: ARCHIVE_MAIN_NODE_ID, name: value('archiveMainName') || '主业务表' }];
+        var nodes = [];
+        document.querySelectorAll('.archive-main-table').forEach(function (element, index) {
+            nodes.push({
+                id: element.dataset.nodeId,
+                name: element.querySelector('.archive-main-name').value.trim() || ('主业务表 ' + (index + 1))
+            });
+        });
         childTables.forEach(function (element, index) {
             nodes.push({
                 id: element.dataset.nodeId,
@@ -274,7 +332,7 @@
         });
         childTables.forEach(function (element) {
             var select = element.querySelector('.archive-child-parent-node');
-            var current = select.value || ARCHIVE_MAIN_NODE_ID;
+            var current = select.value || defaultArchiveMainNodeId();
             select.innerHTML = '';
             nodes.forEach(function (node) {
                 if (node.id === element.dataset.nodeId) { return; }
@@ -285,28 +343,37 @@
             });
             select.value = Array.prototype.some.call(select.options, function (option) {
                 return option.value === current;
-            }) ? current : ARCHIVE_MAIN_NODE_ID;
+            }) ? current : defaultArchiveMainNodeId();
         });
     }
 
+    function defaultArchiveMainNodeId() {
+        var firstMain = document.querySelector('.archive-main-table');
+        return firstMain ? firstMain.dataset.nodeId : ARCHIVE_MAIN_NODE_ID;
+    }
+
     function resetRemovedArchiveParent(removedNodeId) {
-        var resetCount = 0;
         document.querySelectorAll('.archive-child-parent-node').forEach(function (select) {
             if (select.value === removedNodeId) {
                 select.dataset.resetToMain = 'true';
-                resetCount++;
             }
         });
         refreshArchiveParentOptions();
+        return applyRemovedArchiveParentReset();
+    }
+
+    function applyRemovedArchiveParentReset() {
+        var resetCount = 0;
         document.querySelectorAll('.archive-child-parent-node[data-reset-to-main]').forEach(function (select) {
-            select.value = ARCHIVE_MAIN_NODE_ID;
+            select.value = defaultArchiveMainNodeId();
             delete select.dataset.resetToMain;
+            resetCount++;
         });
         return resetCount;
     }
 
     function collectSteps() {
-        return Array.prototype.map.call(document.querySelectorAll('.migration-step'), function (element, index) {
+        return Array.prototype.map.call(document.querySelectorAll(MIGRATION_STEP_SELECTOR), function (element, index) {
             return {
                 name: element.querySelector('.step-name').value.trim() || ('SQL ' + (index + 1)),
                 targetTable: element.querySelector('.target-table').value.trim(),
@@ -320,16 +387,20 @@
     function collectArchiveConfig() {
         return {
             confirmSourceDelete: document.getElementById('archiveConfirmDelete').checked,
-            mainTable: {
-                name: value('archiveMainName') || '主业务表',
-                nodeId: ARCHIVE_MAIN_NODE_ID,
-                parentNodeId: null,
-                sourceTable: value('archiveMainSourceTable'),
-                targetTable: value('archiveMainTargetTable'),
-                cursorColumn: value('archiveMainCursorColumn'),
-                sourceSql: value('archiveMainSql'),
-                relations: []
-            },
+            mainTables: Array.prototype.map.call(document.querySelectorAll('.archive-main-table'),
+                function (element, index) {
+                    return {
+                        name: element.querySelector('.archive-main-name').value.trim()
+                            || ('主业务表 ' + (index + 1)),
+                        nodeId: element.dataset.nodeId,
+                        parentNodeId: null,
+                        sourceTable: element.querySelector('.archive-main-source-table').value.trim(),
+                        targetTable: element.querySelector('.archive-main-target-table').value.trim(),
+                        cursorColumn: element.querySelector('.archive-main-cursor-column').value.trim(),
+                        sourceSql: element.querySelector('.archive-main-sql').value.trim(),
+                        relations: []
+                    };
+                }),
             childTables: Array.prototype.map.call(document.querySelectorAll('.archive-child-table'),
                 function (element, index) {
                     return {

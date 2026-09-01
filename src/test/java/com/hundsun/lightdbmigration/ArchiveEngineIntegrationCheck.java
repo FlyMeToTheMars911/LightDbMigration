@@ -33,7 +33,11 @@ public final class ArchiveEngineIntegrationCheck {
     private static final String CHILD_TWO_TARGET = "LDM_ARC_IT_CHILD2_H";
     private static final String CHILD_THREE_SOURCE = "LDM_ARC_IT_CHILD3_S";
     private static final String CHILD_THREE_TARGET = "LDM_ARC_IT_CHILD3_H";
+    private static final String UUID_SOURCE = "LDM_ARC_IT_UUID_S";
+    private static final String UUID_TARGET = "LDM_ARC_IT_UUID_H";
     private static final String ARCHIVE_NAME_PREFIX = "ARCHIVE_";
+    private static final String TEST_CURSOR_COLUMN = "ID";
+    private static final String EXPLICIT_CURSOR_CHILD_NODE_ID = "CHILD_3";
     private static final int TEST_BATCH_SIZE = 1;
 
     private ArchiveEngineIntegrationCheck() {
@@ -86,6 +90,8 @@ public final class ArchiveEngineIntegrationCheck {
         assertCount(verificationConnection, CHILD_ONE_TARGET, 0L);
         assertCount(verificationConnection, CHILD_TWO_TARGET, 0L);
         assertCount(verificationConnection, CHILD_THREE_TARGET, 0L);
+        assertCount(verificationConnection, UUID_SOURCE, 3L);
+        assertCount(verificationConnection, UUID_TARGET, 0L);
         executeUpdate(verificationConnection, "DELETE FROM " + MAIN_TARGET + " WHERE ID = 101");
         System.out.println("EXPECTED_DUPLICATE_ROLLBACK_PASSED");
     }
@@ -98,6 +104,7 @@ public final class ArchiveEngineIntegrationCheck {
             Map<String, Object> snapshot = task.snapshot(true, 0L);
             throw new AssertionError("归档任务未成功：" + snapshot.get("currentMessage"));
         }
+        assertPaginationModesPreserved(task);
         assertCount(verificationConnection, MAIN_SOURCE, 1L);
         assertCount(verificationConnection, MAIN_TARGET, 2L);
         assertCount(verificationConnection, CHILD_ONE_SOURCE, 1L);
@@ -110,7 +117,33 @@ public final class ArchiveEngineIntegrationCheck {
         assertScalar(verificationConnection, "SELECT MAIN_ID FROM " + CHILD_ONE_SOURCE, 201L);
         assertScalar(verificationConnection, "SELECT ID FROM " + CHILD_TWO_SOURCE, 2003L);
         assertScalar(verificationConnection, "SELECT ID FROM " + CHILD_THREE_SOURCE, 3001L);
-        System.out.println("MAIN_AND_DIRECTED_CHILD_GRAPH_ARCHIVE_PASSED");
+        assertCount(verificationConnection, UUID_SOURCE, 1L);
+        assertCount(verificationConnection, UUID_TARGET, 2L);
+        assertText(verificationConnection, "SELECT ID FROM " + UUID_SOURCE,
+            "7c9e6679-7425-40de-944b-e07fc1f90ae7");
+        assertSqlNotExposedInTaskLogs(task);
+        System.out.println("MULTIPLE_MAIN_TABLES_AND_DIRECTED_CHILD_GRAPH_ARCHIVE_PASSED");
+    }
+
+    private static void assertPaginationModesPreserved(MigrationTask task) {
+        ArchiveRequest archive = task.getRequest().getArchive();
+        List<ArchiveTableRequest> mainTables = archive.getMainTables();
+        if (mainTables.size() != 2 || !TEST_CURSOR_COLUMN.equalsIgnoreCase(mainTables.get(0).getCursorColumn())) {
+            throw new AssertionError("第一张主业务表显式游标配置未保留");
+        }
+        if (mainTables.get(1).getCursorColumn() != null) {
+            throw new AssertionError("随机UUID主表空游标不应被改写为递增游标");
+        }
+        for (ArchiveTableRequest child : archive.getChildTables()) {
+            boolean explicitCursor = EXPLICIT_CURSOR_CHILD_NODE_ID.equals(child.getNodeId());
+            if (explicitCursor && !TEST_CURSOR_COLUMN.equalsIgnoreCase(child.getCursorColumn())) {
+                throw new AssertionError(child.getName() + "显式游标配置未保留");
+            }
+            if (!explicitCursor && child.getCursorColumn() != null) {
+                throw new AssertionError(child.getName() + "空游标不应被改写为主键游标");
+            }
+        }
+        System.out.println("EXPLICIT_KEYSET_AND_BLANK_NON_KEYSET_MODES_PASSED");
     }
 
     private static CreateTaskRequest archiveRequest(DatabaseConfig config) {
@@ -124,30 +157,48 @@ public final class ArchiveEngineIntegrationCheck {
 
         ArchiveRequest archive = new ArchiveRequest();
         archive.setConfirmSourceDelete(Boolean.TRUE);
-        archive.setMainTable(table("主业务表", MAIN_SOURCE, MAIN_TARGET, "ID",
+        ArchiveTableRequest businessMain = table("主业务表", MAIN_SOURCE, MAIN_TARGET, TEST_CURSOR_COLUMN,
             "SELECT ID, TENANT_ID, BIZ_GROUP, NAME FROM " + MAIN_SOURCE
-                + " WHERE NAME LIKE '" + ARCHIVE_NAME_PREFIX + "%'"));
-        archive.getMainTable().setNodeId(MigrationConstants.ARCHIVE_MAIN_NODE_ID);
+                + " WHERE NAME LIKE '" + ARCHIVE_NAME_PREFIX + "%'");
+        businessMain.setNodeId("MAIN_1");
+        ArchiveTableRequest uuidMain = table("随机UUID主表", UUID_SOURCE, UUID_TARGET, null,
+            "SELECT ID, NAME FROM " + UUID_SOURCE + " WHERE NAME LIKE '" + ARCHIVE_NAME_PREFIX + "%'");
+        uuidMain.setNodeId("MAIN_2");
+        archive.setMainTables(Arrays.asList(businessMain, uuidMain));
+        archive.setMainTable(businessMain);
         List<ArchiveTableRequest> children = new ArrayList<>();
-        ArchiveTableRequest childOne = table("主键关联子表", CHILD_ONE_SOURCE, CHILD_ONE_TARGET, "ID", null);
+        ArchiveTableRequest childOne = table("主键关联子表", CHILD_ONE_SOURCE, CHILD_ONE_TARGET, null, null);
         childOne.setNodeId("CHILD_1");
-        childOne.setParentNodeId(MigrationConstants.ARCHIVE_MAIN_NODE_ID);
+        childOne.setParentNodeId("MAIN_1");
         childOne.setRelations(Collections.singletonList(relation("MAIN_ID", "ID")));
         children.add(childOne);
-        ArchiveTableRequest childTwo = table("二级从表", CHILD_TWO_SOURCE, CHILD_TWO_TARGET, "ID", null);
+        ArchiveTableRequest childTwo = table("二级从表", CHILD_TWO_SOURCE, CHILD_TWO_TARGET, null, null);
         childTwo.setNodeId("CHILD_2");
         childTwo.setParentNodeId("CHILD_1");
         childTwo.setRelations(Collections.singletonList(relation("CHILD1_ID", "ID")));
         children.add(childTwo);
-        ArchiveTableRequest childThree = table("复合字段直属从表", CHILD_THREE_SOURCE, CHILD_THREE_TARGET, "ID", null);
-        childThree.setNodeId("CHILD_3");
-        childThree.setParentNodeId(MigrationConstants.ARCHIVE_MAIN_NODE_ID);
+        ArchiveTableRequest childThree = table("复合字段直属从表", CHILD_THREE_SOURCE, CHILD_THREE_TARGET,
+            TEST_CURSOR_COLUMN, null);
+        childThree.setNodeId(EXPLICIT_CURSOR_CHILD_NODE_ID);
+        childThree.setParentNodeId("MAIN_1");
         childThree.setRelations(Arrays.asList(relation("TENANT_ID", "TENANT_ID"),
             relation("BIZ_GROUP", "BIZ_GROUP")));
         children.add(childThree);
         archive.setChildTables(children);
         request.setArchive(archive);
         return request;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void assertSqlNotExposedInTaskLogs(MigrationTask task) {
+        List<Map<String, Object>> logs = (List<Map<String, Object>>)task.snapshot(true, 0L).get("logs");
+        for (Map<String, Object> log : logs) {
+            String message = String.valueOf(log.get("message"));
+            if (message.contains("SQL执行[")) {
+                throw new AssertionError("前端任务日志不应暴露具体执行SQL：" + message);
+            }
+        }
+        System.out.println("ARCHIVE_SQL_NOT_EXPOSED_IN_TASK_LOGS_PASSED");
     }
 
     private static ArchiveTableRequest table(String name, String source, String target, String cursor,
@@ -194,6 +245,9 @@ public final class ArchiveEngineIntegrationCheck {
         executeUpdate(connection, "ALTER TABLE " + CHILD_THREE_TARGET
             + " ADD CONSTRAINT FK_ARC_IT_C3_H FOREIGN KEY (TENANT_ID, BIZ_GROUP) REFERENCES " + MAIN_TARGET
             + " (TENANT_ID, BIZ_GROUP)");
+        executeUpdate(connection, "CREATE TABLE " + UUID_SOURCE
+            + " (ID VARCHAR(36) NOT NULL, NAME VARCHAR(64) NOT NULL, PRIMARY KEY (ID))");
+        executeUpdate(connection, "CREATE TABLE " + UUID_TARGET + " LIKE " + UUID_SOURCE);
         System.out.println("DEDICATED_OBJECTS_CREATED");
     }
 
@@ -206,10 +260,16 @@ public final class ArchiveEngineIntegrationCheck {
             + " (2001, 1001, 'A'), (2002, 1002, 'B'), (2003, 1003, 'KEEP')");
         executeUpdate(connection, "INSERT INTO " + CHILD_THREE_SOURCE + " VALUES"
             + " (3001, 'T1', 'G3', 'KEEP'), (3002, 'T1', 'G1', 'A'), (3003, 'T1', 'G2', 'B')");
+        executeUpdate(connection, "INSERT INTO " + UUID_SOURCE + " VALUES"
+            + " ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'ARCHIVE_A'),"
+            + " ('0f8fad5b-d9cb-469f-a165-70867728950e', 'ARCHIVE_B'),"
+            + " ('7c9e6679-7425-40de-944b-e07fc1f90ae7', 'KEEP')");
         System.out.println("DEDICATED_TEST_DATA_INSERTED");
     }
 
     private static void cleanup(Connection connection) throws Exception {
+        executeUpdate(connection, "DROP TABLE IF EXISTS " + UUID_SOURCE);
+        executeUpdate(connection, "DROP TABLE IF EXISTS " + UUID_TARGET);
         executeUpdate(connection, "DROP TABLE IF EXISTS " + CHILD_TWO_SOURCE);
         executeUpdate(connection, "DROP TABLE IF EXISTS " + CHILD_ONE_SOURCE);
         executeUpdate(connection, "DROP TABLE IF EXISTS " + CHILD_THREE_SOURCE);
@@ -223,7 +283,7 @@ public final class ArchiveEngineIntegrationCheck {
 
     private static void assertObjectsAbsent(Connection connection) throws Exception {
         String sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()"
-            + " AND table_name IN (?, ?, ?, ?, ?, ?, ?, ?)";
+            + " AND table_name IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             String[] tables = tableNames();
             for (int i = 0; i < tables.length; i++) {
@@ -241,7 +301,7 @@ public final class ArchiveEngineIntegrationCheck {
 
     private static String[] tableNames() {
         return new String[] {MAIN_SOURCE, MAIN_TARGET, CHILD_ONE_SOURCE, CHILD_ONE_TARGET, CHILD_TWO_SOURCE,
-            CHILD_TWO_TARGET, CHILD_THREE_SOURCE, CHILD_THREE_TARGET};
+            CHILD_TWO_TARGET, CHILD_THREE_SOURCE, CHILD_THREE_TARGET, UUID_SOURCE, UUID_TARGET};
     }
 
     private static void assertCount(Connection connection, String table, long expected) throws Exception {
@@ -251,6 +311,14 @@ public final class ArchiveEngineIntegrationCheck {
     private static void assertScalar(Connection connection, String sql, long expected) throws Exception {
         try (Statement statement = connection.createStatement(); ResultSet resultSet = statement.executeQuery(sql)) {
             if (!resultSet.next() || resultSet.getLong(1) != expected) {
+                throw new AssertionError("校验失败：" + sql + "，期望=" + expected);
+            }
+        }
+    }
+
+    private static void assertText(Connection connection, String sql, String expected) throws Exception {
+        try (Statement statement = connection.createStatement(); ResultSet resultSet = statement.executeQuery(sql)) {
+            if (!resultSet.next() || !expected.equals(resultSet.getString(1))) {
                 throw new AssertionError("校验失败：" + sql + "，期望=" + expected);
             }
         }

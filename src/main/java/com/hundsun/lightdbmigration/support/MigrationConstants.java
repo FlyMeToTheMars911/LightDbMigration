@@ -11,6 +11,7 @@ public final class MigrationConstants {
     public static final String TASK_TYPE_MIGRATION = "MIGRATION";
     public static final String TASK_TYPE_ARCHIVE = "ARCHIVE";
     public static final String ARCHIVE_MAIN_NODE_ID = "MAIN";
+    public static final String ARCHIVE_MAIN_NODE_PREFIX = "MAIN_";
     public static final String ARCHIVE_CHILD_NODE_PREFIX = "CHILD_";
     public static final int DEFAULT_MYSQL_PORT = 3306;
     public static final int DEFAULT_ORACLE_PORT = 1521;
@@ -19,6 +20,7 @@ public final class MigrationConstants {
     public static final int MAX_BATCH_SIZE = 10000;
     public static final int MAX_ARCHIVE_BATCH_SIZE = 500;
     public static final int MAX_ARCHIVE_RELATIONS = 5;
+    public static final int MIN_ARCHIVE_MAIN_TABLES = 1;
     public static final int MAX_STEPS = 50;
     public static final int MAX_TASKS = 100;
     public static final int MAX_TASK_LOGS = 5000;

@@ -118,21 +118,13 @@
                 <strong>归档会删除源数据</strong>
                 <span>归档表必须已由 DBA 建好且与源表结构相同。请在停写或维护窗口执行，并先完成数据库备份。</span>
             </div>
-            <article class="migration-step archive-main-table">
-                <div class="migration-step-head"><strong>主业务表</strong></div>
-                <div class="step-form-grid">
-                    <label>配置名称<input id="archiveMainName" type="text" value="主业务表"></label>
-                    <label>主业务源表<input id="archiveMainSourceTable" type="text" placeholder="表名或 模式名.表名"></label>
-                    <label>主业务归档表<input id="archiveMainTargetTable" type="text" placeholder="表名或 模式名.表名"></label>
-                    <label>递增唯一游标字段<input id="archiveMainCursorColumn" type="text" placeholder="例如 ID"></label>
-                </div>
-                <label>主表归档范围查询 SQL
-                    <textarea id="archiveMainSql" rows="7" spellcheck="false" placeholder="SELECT * FROM BUSINESS_MAIN WHERE CREATED_AT &lt; '2025-01-01'"></textarea>
-                </label>
-                <div class="field-help">查询必须返回主业务源表的全部字段，游标在本次归档范围内必须非空且唯一。工具以该查询结果作为主表归档范围。</div>
-            </article>
             <div class="archive-child-heading">
-                <div><strong>关联从业务表</strong><span>每张从表可选择主表或另一张从表作为上级，形成无循环的有向关系。</span></div>
+                <div><strong>主业务表</strong><span>可配置多张主表；每张主表都是一棵归档关系树的根，按配置顺序依次执行。</span></div>
+                <button type="button" id="addArchiveMainButton" class="button secondary">＋ 添加主业务表</button>
+            </div>
+            <div id="archiveMainsContainer" class="steps-container"></div>
+            <div class="archive-child-heading">
+                <div><strong>关联从业务表</strong><span>每张从表必须选择某张主表或另一张从表作为上级，形成无循环的有向关系。</span></div>
                 <button type="button" id="addArchiveChildButton" class="button secondary">＋ 添加子业务表</button>
             </div>
             <div id="archiveChildrenContainer" class="steps-container"></div>
@@ -211,6 +203,26 @@
     </article>
 </template>
 
+<template id="archiveMainTemplate">
+    <article class="migration-step archive-main-table">
+        <div class="migration-step-head">
+            <strong class="archive-main-title">主业务表 1</strong>
+            <button type="button" class="icon-button remove-archive-main" title="删除本张主业务表">×</button>
+        </div>
+        <div class="step-form-grid">
+            <label>配置名称<input class="archive-main-name" type="text" placeholder="例如：业务主表"></label>
+            <label>节点标识<input class="archive-main-node-id" type="text" readonly></label>
+            <label>主业务源表<input class="archive-main-source-table" type="text" placeholder="表名或 模式名.表名"></label>
+            <label>主业务归档表<input class="archive-main-target-table" type="text" placeholder="表名或 模式名.表名"></label>
+            <label>递增唯一游标字段（可留空）<input class="archive-main-cursor-column" type="text" placeholder="留空不启用游标分页；或填写自增 ID"></label>
+        </div>
+        <label>主表归档范围查询 SQL
+            <textarea class="archive-main-sql" rows="7" spellcheck="false" placeholder="SELECT * FROM BUSINESS_MAIN WHERE CREATED_AT &lt; '2025-01-01'"></textarea>
+        </label>
+        <div class="field-help">查询必须返回主业务源表的全部字段。填写后按递增游标做 Keyset 分页；留空时单列主键只用于稳定排序和精确删除，归档后重复读取当前首批，不假设主键递增。</div>
+    </article>
+</template>
+
 <template id="archiveChildTemplate">
     <article class="migration-step archive-child-table">
         <div class="migration-step-head">
@@ -223,7 +235,7 @@
             <label>关联上级节点<select class="archive-child-parent-node"></select></label>
             <label>子业务源表<input class="archive-child-source-table" type="text" placeholder="表名或 模式名.表名"></label>
             <label>子业务归档表<input class="archive-child-target-table" type="text" placeholder="表名或 模式名.表名"></label>
-            <label>子表递增唯一游标字段<input class="archive-child-cursor-column" type="text" placeholder="例如 DETAIL_ID"></label>
+            <label>子表递增唯一游标字段（可留空）<input class="archive-child-cursor-column" type="text" placeholder="留空不启用游标分页；或填写自增 DETAIL_ID"></label>
         </div>
         <label>与上级表的关联字段映射
             <input class="archive-child-relations" type="text" placeholder="例如 PARENT_ID=ID；复合关联用逗号分隔：TENANT_ID=TENANT_ID, PARENT_ID=ID">

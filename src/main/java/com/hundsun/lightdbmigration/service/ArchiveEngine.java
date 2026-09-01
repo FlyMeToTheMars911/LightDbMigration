@@ -11,6 +11,7 @@ import com.hundsun.lightdbmigration.support.SqlSupport.QualifiedName;
 import org.springframework.stereotype.Component;
 
 import java.sql.Connection;
+import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
@@ -25,6 +26,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 
 @Component
@@ -38,6 +41,8 @@ public class ArchiveEngine {
     private static final String PARENT_ALIAS = "LM_PARENT";
     private static final String CHILD_ALIAS = "LM_CHILD";
     private static final String PAGE_ALIAS = "LM_ARCHIVE_PAGE";
+    private static final int MAX_SQL_LOG_PARAMETERS = 50;
+    private static final int MAX_SQL_LOG_VALUE_LENGTH = 160;
 
     public void execute(MigrationTask task) {
         Connection connection = null;
@@ -49,7 +54,8 @@ public class ArchiveEngine {
                 + DatabaseSupport.displayEndpoint(task.getRequest().getSource()));
             connection = DatabaseSupport.open(task.getRequest().getSource());
             connection.setAutoCommit(false);
-            task.info("归档数据库连接成功；主表写入、子表写入、子表删除和主表删除将在每个主表批次内共同提交");
+            task.info("归档数据库连接成功；每张主表的写入、关联子表写入、子表删除和主表删除"
+                + "将在各自主表批次内共同提交");
 
             PreparedArchive prepared = prepare(task, connection, databaseType);
             task.setTotalRows(prepared.totalRows);
@@ -57,7 +63,7 @@ public class ArchiveEngine {
                 + " 行；归档采用严格写入，任何重复键或删除数量不一致都会回滚当前主表批次");
             markAllSteps(task, prepared, STEP_RUNNING);
             task.markRunning("正在按主表批次执行同库归档");
-            archiveByMainBatch(task, connection, prepared, task.getRequest().getBatchSize(), databaseType);
+            archiveAllMainTables(task, connection, prepared, task.getRequest().getBatchSize(), databaseType);
             markAllSteps(task, prepared, STEP_SUCCEEDED);
             task.checkpoint();
             task.markSucceeded();
@@ -89,19 +95,23 @@ public class ArchiveEngine {
 
     private PreparedArchive prepare(MigrationTask task, Connection connection, String databaseType) throws Exception {
         ArchiveRequest archiveRequest = task.getRequest().getArchive();
-        ArchiveTableRequest mainRequest = archiveRequest.getMainTable();
-        task.setStepStatus(0, STEP_VALIDATING);
-        task.markValidating("正在校验主业务表归档配置：" + mainRequest.getName());
-        String mainSql = SqlSupport.normalizeSourceQuery(mainRequest.getSourceSql());
-        PreparedArchiveTable mainTable = prepareTable(task, connection, mainRequest, 0, mainSql, databaseType);
-
+        List<PreparedArchiveTable> mainTables = new ArrayList<>();
         List<PreparedArchiveTable> childTables = new ArrayList<>();
         Map<String, PreparedArchiveTable> preparedByNodeId = new LinkedHashMap<>();
-        preparedByNodeId.put(MigrationConstants.ARCHIVE_MAIN_NODE_ID, mainTable);
+        for (int i = 0; i < archiveRequest.getMainTables().size(); i++) {
+            ArchiveTableRequest mainRequest = archiveRequest.getMainTables().get(i);
+            task.setStepStatus(i, STEP_VALIDATING);
+            task.markValidating("正在校验主业务表归档配置：" + mainRequest.getName());
+            String mainSql = SqlSupport.normalizeSourceQuery(mainRequest.getSourceSql());
+            PreparedArchiveTable mainTable = prepareTable(task, connection, mainRequest, i, mainSql, databaseType);
+            mainTables.add(mainTable);
+            preparedByNodeId.put(mainRequest.getNodeId(), mainTable);
+        }
+        int childStepOffset = mainTables.size();
         for (int i = 0; i < archiveRequest.getChildTables().size(); i++) {
             task.checkpoint();
             ArchiveTableRequest childRequest = archiveRequest.getChildTables().get(i);
-            int stepIndex = i + 1;
+            int stepIndex = childStepOffset + i;
             task.setStepStatus(stepIndex, STEP_VALIDATING);
             task.markValidating("正在校验子业务表归档配置：" + childRequest.getName());
             PreparedArchiveTable parentTable = preparedByNodeId.get(childRequest.getParentNodeId());
@@ -116,20 +126,23 @@ public class ArchiveEngine {
             childTables.add(childTable);
             preparedByNodeId.put(childRequest.getNodeId(), childTable);
         }
-        validateNoPhysicalTableOverlap(mainTable, childTables);
+        validateNoPhysicalTableOverlap(mainTables, childTables);
         Map<String, List<PreparedArchiveTable>> childrenByParentNodeId = buildChildrenByParentNodeId(childTables);
 
-        long totalRows = mainTable.totalRows;
-        task.setStepTotal(0, mainTable.totalRows);
-        task.setStepStatus(0, STEP_VALIDATED);
-        task.info("归档校验通过：" + mainTable.displayName + "，预计 " + mainTable.totalRows + " 行");
+        long totalRows = 0L;
+        for (PreparedArchiveTable mainTable : mainTables) {
+            totalRows += mainTable.totalRows;
+            task.setStepTotal(mainTable.index, mainTable.totalRows);
+            task.setStepStatus(mainTable.index, STEP_VALIDATED);
+            task.info("归档校验通过：" + mainTable.displayName + "，预计 " + mainTable.totalRows + " 行");
+        }
         for (PreparedArchiveTable childTable : childTables) {
             totalRows += childTable.totalRows;
             task.setStepTotal(childTable.index, childTable.totalRows);
             task.setStepStatus(childTable.index, STEP_VALIDATED);
             task.info("归档校验通过：" + childTable.displayName + "，预计 " + childTable.totalRows + " 行");
         }
-        return new PreparedArchive(mainTable, childTables, childrenByParentNodeId, totalRows);
+        return new PreparedArchive(mainTables, childTables, childrenByParentNodeId, totalRows);
     }
 
     private PreparedArchiveTable prepareTable(MigrationTask task, Connection connection, ArchiveTableRequest request,
@@ -149,23 +162,36 @@ public class ArchiveEngine {
         validateUniqueColumnNames(queryColumns, request.getName() + "归档查询");
         validateSameStructure(sourceTableColumns, targetTableColumns, request.getName());
         validateQueryCoversSourceTable(queryColumns, sourceTableColumns, request.getName());
-        int cursorIndex = resolveColumnIndex(request.getCursorColumn(), queryColumns,
-            request.getName() + "唯一游标字段");
-        validateCursorInSourceTable(request.getCursorColumn(), sourceTableColumns, request.getName());
-        long totalRows = countAndValidateCursor(task, connection, sourceSql, queryColumns.get(cursorIndex),
-            databaseType, request.getName());
+        boolean keysetPagination = request.getCursorColumn() != null
+            && !request.getCursorColumn().trim().isEmpty();
+        String keyColumn = resolveArchiveKeyColumn(task, connection, request, sourceName, sourceTableColumns,
+            queryColumns, databaseType, keysetPagination);
+        String keyLabel = keysetPagination ? "唯一游标字段" : "单列主键删除键";
+        int keyIndex = resolveColumnIndex(keyColumn, queryColumns, request.getName() + keyLabel);
+        long totalRows = countAndValidateArchiveKey(task, connection, sourceSql, queryColumns.get(keyIndex),
+            databaseType, request.getName(), keyLabel);
         String insertSql = buildInsertSql(targetName, queryColumns, databaseType);
         return new PreparedArchiveTable(index, request, sourceName, targetName, sourceIdentity, targetIdentity,
-            sourceSql, queryColumns, cursorIndex, insertSql, totalRows);
+            sourceSql, queryColumns, keyIndex, keysetPagination, insertSql, totalRows);
+    }
+
+    private void archiveAllMainTables(MigrationTask task, Connection connection, PreparedArchive prepared,
+        int batchSize, String databaseType) throws Exception {
+        for (int i = 0; i < prepared.mainTables.size(); i++) {
+            PreparedArchiveTable mainTable = prepared.mainTables.get(i);
+            task.checkpoint();
+            task.info("开始归档主业务表 " + (i + 1) + "/" + prepared.mainTables.size() + "："
+                + mainTable.displayName + "（节点 " + mainTable.request.getNodeId() + "）");
+            archiveByMainBatch(task, connection, prepared, mainTable, batchSize, databaseType);
+        }
     }
 
     private void archiveByMainBatch(MigrationTask task, Connection connection, PreparedArchive prepared,
-        int batchSize, String databaseType) throws Exception {
-        PreparedArchiveTable mainTable = prepared.mainTable;
-        Object upperBound = queryUpperBound(task, connection, mainTable.sourceSql,
-            mainTable.cursorColumn(), databaseType, new ArrayList<Object>());
-        if (upperBound == null) {
-            task.info("主业务表归档查询没有待处理数据，任务无需变更数据库");
+        PreparedArchiveTable mainTable, int batchSize, String databaseType) throws Exception {
+        Object upperBound = mainTable.keysetPagination ? queryUpperBound(task, connection, mainTable.sourceSql,
+            mainTable.keyColumn(), databaseType, new ArrayList<Object>()) : null;
+        if (mainTable.keysetPagination && upperBound == null) {
+            task.info("主业务表 " + mainTable.displayName + " 归档查询没有待处理数据，无需变更数据库");
             return;
         }
         Object lastKey = null;
@@ -173,44 +199,57 @@ public class ArchiveEngine {
         while (true) {
             task.checkpoint();
             long batchStartedNanos = System.nanoTime();
-            QueryWithParameters mainPage = buildPageSql(mainTable.sourceSql, mainTable.cursorColumn(), databaseType,
-                batchSize, new ArrayList<Object>(), lastKey, upperBound);
+            QueryWithParameters mainPage = mainTable.keysetPagination
+                ? buildPageSql(mainTable.sourceSql, mainTable.keyColumn(), databaseType, batchSize,
+                    new ArrayList<Object>(), lastKey, upperBound)
+                : buildCurrentFirstPageSql(mainTable.sourceSql, mainTable.keyColumn(), databaseType, batchSize,
+                    new ArrayList<Object>());
             List<Object[]> mainRows = queryRows(task, connection, mainPage, mainTable.columns, batchSize);
             if (mainRows.isEmpty()) {
+                if (mainBatchNumber == 0L) {
+                    task.info("主业务表 " + mainTable.displayName + " 归档查询没有待处理数据，无需变更数据库");
+                }
                 break;
             }
-            Object currentLastKey = mainRows.get(mainRows.size() - 1)[mainTable.cursorIndex];
-            if (lastKey != null && cursorValuesEqual(lastKey, currentLastKey)) {
-                throw new IllegalStateException("主业务表游标未推进，请检查字段 " + mainTable.cursorColumn().name);
+            Object currentLastKey = null;
+            if (mainTable.keysetPagination) {
+                currentLastKey = mainRows.get(mainRows.size() - 1)[mainTable.keyIndex];
+                if (lastKey != null && cursorValuesEqual(lastKey, currentLastKey)) {
+                    throw new IllegalStateException("主业务表 " + mainTable.displayName + " 游标未推进，请检查字段 "
+                        + mainTable.keyColumn().name);
+                }
             }
             mainBatchNumber++;
-            executeArchiveTransaction(task, connection, prepared, mainRows, mainBatchNumber, databaseType,
-                batchStartedNanos);
-            lastKey = currentLastKey;
-            if (mainRows.size() < batchSize || cursorValuesEqual(lastKey, upperBound)) {
-                break;
+            executeArchiveTransaction(task, connection, prepared, mainTable, mainRows, mainBatchNumber,
+                databaseType, batchStartedNanos);
+            if (mainTable.keysetPagination) {
+                lastKey = currentLastKey;
+                if (mainRows.size() < batchSize || cursorValuesEqual(lastKey, upperBound)) {
+                    break;
+                }
             }
         }
     }
 
     private void executeArchiveTransaction(MigrationTask task, Connection connection, PreparedArchive prepared,
-        List<Object[]> mainRows, long mainBatchNumber, String databaseType, long batchStartedNanos) throws Exception {
+        PreparedArchiveTable mainTable, List<Object[]> mainRows, long mainBatchNumber, String databaseType,
+        long batchStartedNanos) throws Exception {
         Map<Integer, ArchiveBatchStats> childStats = new LinkedHashMap<>();
         try {
-            long mainInserted = insertRows(task, connection, prepared.mainTable, mainRows);
+            long mainInserted = insertRows(task, connection, mainTable, mainRows);
             if (mainInserted != mainRows.size()) {
                 throw new SQLException("主业务归档表写入数量不一致，期望 " + mainRows.size() + " 行，实际 "
                     + mainInserted + " 行");
             }
-            for (PreparedArchiveTable childTable : prepared.childrenOf(MigrationConstants.ARCHIVE_MAIN_NODE_ID)) {
+            for (PreparedArchiveTable childTable : prepared.childrenOf(mainTable.request.getNodeId())) {
                 task.stopCheckpoint();
                 archiveRelatedSubtree(task, connection, prepared, childTable, mainRows,
                     task.getRequest().getBatchSize(), databaseType, childStats);
             }
-            for (PreparedArchiveTable childTable : prepared.childrenOf(MigrationConstants.ARCHIVE_MAIN_NODE_ID)) {
+            for (PreparedArchiveTable childTable : prepared.childrenOf(mainTable.request.getNodeId())) {
                 assertNoRelatedChildrenRemain(task, connection, childTable, mainRows, databaseType);
             }
-            long mainDeleted = deleteRows(task, connection, prepared.mainTable, mainRows, databaseType);
+            long mainDeleted = deleteRows(task, connection, mainTable, mainRows, databaseType);
             if (mainDeleted != mainRows.size()) {
                 throw new SQLException("主业务源表删除数量不一致，期望 " + mainRows.size() + " 行，实际 "
                     + mainDeleted + " 行；已回滚当前批次");
@@ -218,14 +257,15 @@ public class ArchiveEngine {
             task.stopCheckpoint();
             connection.commit();
 
-            task.addArchiveBatch(prepared.mainTable.index, mainRows.size(), mainInserted, mainDeleted);
+            task.addArchiveBatch(mainTable.index, mainRows.size(), mainInserted, mainDeleted);
             for (PreparedArchiveTable childTable : prepared.childTables) {
                 ArchiveBatchStats stats = childStats.get(childTable.index);
                 if (stats != null && stats.processed > 0L) {
                     task.addArchiveBatch(childTable.index, stats.processed, stats.inserted, stats.deleted);
                 }
             }
-            task.info("归档主批次 " + mainBatchNumber + " 已提交：主表写入/删除 " + mainRows.size()
+            task.info("归档主表 " + mainTable.displayName + " 批次 " + mainBatchNumber
+                + " 已提交：主表写入/删除 " + mainRows.size()
                 + " 行，子表合计写入/删除 " + sumProcessed(childStats) + " 行，耗时 "
                 + elapsedMillis(batchStartedNanos) + " ms");
         } catch (Exception exception) {
@@ -241,9 +281,9 @@ public class ArchiveEngine {
         if (relationQuery.parameters.isEmpty()) {
             return;
         }
-        Object upperBound = queryUpperBound(task, connection, relationQuery.sql, childTable.cursorColumn(),
-            databaseType, relationQuery.parameters);
-        if (upperBound == null) {
+        Object upperBound = childTable.keysetPagination ? queryUpperBound(task, connection, relationQuery.sql,
+            childTable.keyColumn(), databaseType, relationQuery.parameters) : null;
+        if (childTable.keysetPagination && upperBound == null) {
             return;
         }
         ArchiveBatchStats stats = childStats.get(childTable.index);
@@ -254,15 +294,21 @@ public class ArchiveEngine {
         Object lastKey = null;
         while (true) {
             task.stopCheckpoint();
-            QueryWithParameters childPage = buildPageSql(relationQuery.sql, childTable.cursorColumn(), databaseType,
-                batchSize, relationQuery.parameters, lastKey, upperBound);
+            QueryWithParameters childPage = childTable.keysetPagination
+                ? buildPageSql(relationQuery.sql, childTable.keyColumn(), databaseType, batchSize,
+                    relationQuery.parameters, lastKey, upperBound)
+                : buildCurrentFirstPageSql(relationQuery.sql, childTable.keyColumn(), databaseType, batchSize,
+                    relationQuery.parameters);
             List<Object[]> childRows = queryRows(task, connection, childPage, childTable.columns, batchSize);
             if (childRows.isEmpty()) {
                 break;
             }
-            Object currentLastKey = childRows.get(childRows.size() - 1)[childTable.cursorIndex];
-            if (lastKey != null && cursorValuesEqual(lastKey, currentLastKey)) {
-                throw new IllegalStateException("子业务表 " + childTable.displayName + " 游标未推进");
+            Object currentLastKey = null;
+            if (childTable.keysetPagination) {
+                currentLastKey = childRows.get(childRows.size() - 1)[childTable.keyIndex];
+                if (lastKey != null && cursorValuesEqual(lastKey, currentLastKey)) {
+                    throw new IllegalStateException("子业务表 " + childTable.displayName + " 游标未推进");
+                }
             }
             long inserted = insertRows(task, connection, childTable, childRows);
             if (inserted != childRows.size()) {
@@ -283,9 +329,11 @@ public class ArchiveEngine {
             stats.processed += childRows.size();
             stats.inserted += inserted;
             stats.deleted += deleted;
-            lastKey = currentLastKey;
-            if (childRows.size() < batchSize || cursorValuesEqual(lastKey, upperBound)) {
-                break;
+            if (childTable.keysetPagination) {
+                lastKey = currentLastKey;
+                if (childRows.size() < batchSize || cursorValuesEqual(lastKey, upperBound)) {
+                    break;
+                }
             }
         }
     }
@@ -363,6 +411,7 @@ public class ArchiveEngine {
 
     private long insertRows(MigrationTask task, Connection connection, PreparedArchiveTable table,
         List<Object[]> rows) throws Exception {
+        logBatchSql(task, "归档写入 " + table.displayName, table.insertSql, rows);
         try (PreparedStatement statement = connection.prepareStatement(table.insertSql)) {
             task.setCurrentStatement(statement);
             try {
@@ -382,15 +431,19 @@ public class ArchiveEngine {
 
     private long deleteRows(MigrationTask task, Connection connection, PreparedArchiveTable table,
         List<Object[]> rows, String databaseType) throws Exception {
-        String quotedCursor = SqlSupport.quoteIdentifier(table.cursorColumn().name, databaseType);
-        String sql = "DELETE FROM " + quoteQualifiedName(table.sourceName, databaseType) + " WHERE " + quotedCursor
+        String quotedKey = SqlSupport.quoteIdentifier(table.keyColumn().name, databaseType);
+        String sql = "DELETE FROM " + quoteQualifiedName(table.sourceName, databaseType) + " WHERE " + quotedKey
             + " IN (" + placeholders(rows.size()) + ")";
+        List<Object> parameters = new ArrayList<>();
+        for (Object[] row : rows) {
+            parameters.add(row[table.keyIndex]);
+        }
+        logSql(task, "源表删除 " + table.displayName, sql, parameters);
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             task.setCurrentStatement(statement);
             try {
                 for (int i = 0; i < rows.size(); i++) {
-                    setStatementValue(statement, i + 1, rows.get(i)[table.cursorIndex],
-                        table.cursorColumn().jdbcType);
+                    setStatementValue(statement, i + 1, rows.get(i)[table.keyIndex], table.keyColumn().jdbcType);
                 }
                 return statement.executeUpdate();
             } finally {
@@ -404,6 +457,7 @@ public class ArchiveEngine {
         String quotedCursor = SqlSupport.quoteIdentifier(cursorColumn.name, databaseType);
         String sql = "SELECT MAX(" + PAGE_ALIAS + "." + quotedCursor + ") FROM (" + sourceSql + ") "
             + PAGE_ALIAS;
+        logSql(task, "游标上界", sql, parameters);
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             bindParameters(statement, parameters);
             task.setCurrentStatement(statement);
@@ -437,9 +491,20 @@ public class ArchiveEngine {
         return new QueryWithParameters(sql, parameters);
     }
 
+    private QueryWithParameters buildCurrentFirstPageSql(String sourceSql, ColumnMeta keyColumn,
+        String databaseType, int batchSize, List<Object> sourceParameters) {
+        String quotedKey = SqlSupport.quoteIdentifier(keyColumn.name, databaseType);
+        String ordered = "SELECT " + PAGE_ALIAS + ".* FROM (" + sourceSql + ") " + PAGE_ALIAS + " ORDER BY "
+            + PAGE_ALIAS + "." + quotedKey + " ASC";
+        String sql = MigrationConstants.DB_MYSQL.equals(databaseType) ? ordered + " LIMIT " + batchSize
+            : "SELECT * FROM (" + ordered + ") WHERE ROWNUM <= " + batchSize;
+        return new QueryWithParameters(sql, new ArrayList<>(sourceParameters));
+    }
+
     private List<Object[]> queryRows(MigrationTask task, Connection connection, QueryWithParameters query,
         List<ColumnMeta> columns, int fetchSize) throws Exception {
         List<Object[]> result = new ArrayList<>();
+        logSql(task, "批次查询", query.sql, query.parameters);
         try (PreparedStatement statement = connection.prepareStatement(query.sql)) {
             bindParameters(statement, query.parameters);
             statement.setFetchSize(fetchSize);
@@ -461,9 +526,63 @@ public class ArchiveEngine {
         return readQueryColumns(task, connection, sql);
     }
 
+    private String resolveArchiveKeyColumn(MigrationTask task, Connection connection, ArchiveTableRequest request,
+        QualifiedName sourceName, List<ColumnMeta> sourceColumns, List<ColumnMeta> queryColumns, String databaseType,
+        boolean keysetPagination) throws SQLException {
+        String configuredCursor = request.getCursorColumn();
+        String resolvedCursor;
+        if (!keysetPagination) {
+            List<String> primaryKeyColumns = readPrimaryKeyColumns(connection, sourceName, databaseType);
+            if (primaryKeyColumns.isEmpty()) {
+                throw new IllegalArgumentException(request.getName() + "未配置唯一游标字段，且源表 "
+                    + sourceName.toSql() + " 未检测到主键；无游标模式需要单列主键作为精确删除键");
+            }
+            if (primaryKeyColumns.size() != 1) {
+                throw new IllegalArgumentException(request.getName() + "未配置唯一游标字段，且源表 "
+                    + sourceName.toSql() + " 使用 " + primaryKeyColumns.size()
+                    + " 列复合主键；无游标模式当前仅支持单列主键，请手工填写递增唯一游标字段");
+            }
+            resolvedCursor = primaryKeyColumns.get(0);
+            task.info(request.getName() + "未配置递增唯一游标字段；单列主键 " + resolvedCursor
+                + " 仅用于稳定排序和精确删除，将采用删除后重复读取当前首批的非游标模式");
+        } else {
+            resolvedCursor = SqlSupport.normalizeColumnName(configuredCursor, request.getName() + "唯一游标字段");
+            request.setCursorColumn(resolvedCursor);
+        }
+        String keyLabel = keysetPagination ? "唯一游标字段" : "单列主键删除键";
+        resolveColumnIndex(resolvedCursor, sourceColumns, request.getName() + "源表" + keyLabel);
+        resolveColumnIndex(resolvedCursor, queryColumns, request.getName() + "归档查询" + keyLabel);
+        return resolvedCursor;
+    }
+
+    private List<String> readPrimaryKeyColumns(Connection connection, QualifiedName tableName, String databaseType)
+        throws SQLException {
+        DatabaseMetaData metadata = connection.getMetaData();
+        String catalog = null;
+        String schema = null;
+        if (MigrationConstants.DB_MYSQL.equals(databaseType)) {
+            catalog = tableName.getSchema() == null ? connection.getCatalog() : tableName.getSchema();
+        } else {
+            schema = tableName.getSchema() == null ? metadata.getUserName() : tableName.getSchema();
+        }
+        String metadataTable = configuredIdentifier(tableName.getTable(), databaseType);
+        String metadataSchema = schema == null ? null : configuredIdentifier(schema, databaseType);
+        SortedMap<Short, String> primaryKeyBySequence = new TreeMap<>();
+        try (ResultSet resultSet = metadata.getPrimaryKeys(catalog, metadataSchema, metadataTable)) {
+            while (resultSet.next()) {
+                String columnName = resultSet.getString("COLUMN_NAME");
+                if (columnName != null && !columnName.trim().isEmpty()) {
+                    primaryKeyBySequence.put(resultSet.getShort("KEY_SEQ"), columnName);
+                }
+            }
+        }
+        return new ArrayList<>(primaryKeyBySequence.values());
+    }
+
     private List<ColumnMeta> readQueryColumns(MigrationTask task, Connection connection, String sourceSql)
         throws Exception {
         String sql = "SELECT * FROM (" + sourceSql + ") LM_ARCHIVE_META WHERE 1 = 0";
+        logSql(task, "字段元数据校验", sql, java.util.Collections.<Object>emptyList());
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             task.setCurrentStatement(statement);
             try (ResultSet resultSet = statement.executeQuery()) {
@@ -541,17 +660,13 @@ public class ArchiveEngine {
             && left.nullable == right.nullable;
     }
 
-    private void validateCursorInSourceTable(String cursorColumn, List<ColumnMeta> sourceColumns,
-        String displayName) {
-        resolveColumnIndex(cursorColumn, sourceColumns, displayName + "源表唯一游标字段");
-    }
-
-    private long countAndValidateCursor(MigrationTask task, Connection connection, String sourceSql,
-        ColumnMeta cursorColumn, String databaseType, String displayName) throws Exception {
-        String quotedCursor = SqlSupport.quoteIdentifier(cursorColumn.name, databaseType);
-        String reference = "LM_ARCHIVE_STATS." + quotedCursor;
+    private long countAndValidateArchiveKey(MigrationTask task, Connection connection, String sourceSql,
+        ColumnMeta keyColumn, String databaseType, String displayName, String keyLabel) throws Exception {
+        String quotedKey = SqlSupport.quoteIdentifier(keyColumn.name, databaseType);
+        String reference = "LM_ARCHIVE_STATS." + quotedKey;
         String sql = "SELECT COUNT(*), COUNT(" + reference + "), COUNT(DISTINCT " + reference + ") FROM ("
             + sourceSql + ") LM_ARCHIVE_STATS";
+        logSql(task, "归档范围统计", sql, java.util.Collections.<Object>emptyList());
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             task.setCurrentStatement(statement);
             try (ResultSet resultSet = statement.executeQuery()) {
@@ -562,11 +677,11 @@ public class ArchiveEngine {
                 long nonNullRows = resultSet.getLong(2);
                 long distinctRows = resultSet.getLong(3);
                 if (nonNullRows != totalRows) {
-                    throw new IllegalArgumentException(displayName + "唯一游标字段 " + cursorColumn.name
+                    throw new IllegalArgumentException(displayName + keyLabel + " " + keyColumn.name
                         + " 存在空值");
                 }
                 if (distinctRows != totalRows) {
-                    throw new IllegalArgumentException(displayName + "唯一游标字段 " + cursorColumn.name
+                    throw new IllegalArgumentException(displayName + keyLabel + " " + keyColumn.name
                         + " 在本次归档范围内不唯一");
                 }
                 return totalRows;
@@ -664,12 +779,59 @@ public class ArchiveEngine {
         return normalizeName(namespace) + "." + normalizeName(name.getTable());
     }
 
-    private void validateNoPhysicalTableOverlap(PreparedArchiveTable mainTable,
+    private void logSql(MigrationTask task, String operation, String sql, List<Object> parameters) {
+        task.backendSql("SQL执行[" + operation + "]：" + sql + "；参数=" + formatSqlParameters(parameters));
+    }
+
+    private void logBatchSql(MigrationTask task, String operation, String sql, List<Object[]> rows) {
+        task.backendSql("SQL执行[" + operation + "]：" + sql + "；JDBC批量行数=" + rows.size()
+            + "；业务字段参数不逐行展开，避免后台日志写入完整业务数据");
+    }
+
+    private String formatSqlParameters(List<Object> parameters) {
+        if (parameters == null || parameters.isEmpty()) {
+            return "[]";
+        }
+        StringBuilder result = new StringBuilder("[");
+        int loggedCount = Math.min(parameters.size(), MAX_SQL_LOG_PARAMETERS);
+        for (int i = 0; i < loggedCount; i++) {
+            if (i > 0) {
+                result.append(", ");
+            }
+            result.append(formatSqlParameter(parameters.get(i)));
+        }
+        if (parameters.size() > loggedCount) {
+            result.append(", ... 共").append(parameters.size()).append("个参数");
+        }
+        return result.append(']').toString();
+    }
+
+    private String formatSqlParameter(Object value) {
+        if (value == null) {
+            return "NULL";
+        }
+        if (value instanceof byte[]) {
+            return "[BINARY length=" + ((byte[])value).length + "]";
+        }
+        String text = String.valueOf(value).replace("'", "''").replace("\r", "\\r").replace("\n", "\\n");
+        if (text.length() > MAX_SQL_LOG_VALUE_LENGTH) {
+            text = text.substring(0, MAX_SQL_LOG_VALUE_LENGTH) + "...";
+        }
+        return value instanceof Number || value instanceof Boolean ? text : "'" + text + "'";
+    }
+
+    private void validateNoPhysicalTableOverlap(List<PreparedArchiveTable> mainTables,
         List<PreparedArchiveTable> childTables) {
         Set<String> sourceIdentities = new LinkedHashSet<>();
         Set<String> targetIdentities = new LinkedHashSet<>();
-        sourceIdentities.add(mainTable.sourceIdentity);
-        targetIdentities.add(mainTable.targetIdentity);
+        for (PreparedArchiveTable mainTable : mainTables) {
+            if (!sourceIdentities.add(mainTable.sourceIdentity)) {
+                throw new IllegalArgumentException("重复配置物理源表：" + mainTable.sourceName.toSql());
+            }
+            if (!targetIdentities.add(mainTable.targetIdentity)) {
+                throw new IllegalArgumentException("重复配置物理归档表：" + mainTable.targetName.toSql());
+            }
+        }
         for (PreparedArchiveTable childTable : childTables) {
             if (!sourceIdentities.add(childTable.sourceIdentity)) {
                 throw new IllegalArgumentException("重复配置物理源表：" + childTable.sourceName.toSql());
@@ -743,6 +905,7 @@ public class ArchiveEngine {
 
     private long queryLong(MigrationTask task, Connection connection, String sql, List<Object> parameters)
         throws Exception {
+        logSql(task, "归档完整性校验", sql, parameters);
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             bindParameters(statement, parameters);
             task.setCurrentStatement(statement);
@@ -811,7 +974,9 @@ public class ArchiveEngine {
     }
 
     private void markAllSteps(MigrationTask task, PreparedArchive prepared, String status) {
-        task.setStepStatus(prepared.mainTable.index, status);
+        for (PreparedArchiveTable mainTable : prepared.mainTables) {
+            task.setStepStatus(mainTable.index, status);
+        }
         for (PreparedArchiveTable childTable : prepared.childTables) {
             task.setStepStatus(childTable.index, status);
         }
@@ -819,7 +984,9 @@ public class ArchiveEngine {
 
     private void markRunningStepsFailed(MigrationTask task) {
         ArchiveRequest archive = task.getRequest().getArchive();
-        int tableCount = archive == null || archive.getChildTables() == null ? 1 : archive.getChildTables().size() + 1;
+        int mainTableCount = archive == null || archive.getMainTables() == null ? 0 : archive.getMainTables().size();
+        int childTableCount = archive == null || archive.getChildTables() == null ? 0 : archive.getChildTables().size();
+        int tableCount = mainTableCount + childTableCount;
         for (int i = 0; i < tableCount; i++) {
             task.setStepStatus(i, STEP_FAILED);
         }
@@ -846,14 +1013,14 @@ public class ArchiveEngine {
     }
 
     private static final class PreparedArchive {
-        private final PreparedArchiveTable mainTable;
+        private final List<PreparedArchiveTable> mainTables;
         private final List<PreparedArchiveTable> childTables;
         private final Map<String, List<PreparedArchiveTable>> childrenByParentNodeId;
         private final long totalRows;
 
-        private PreparedArchive(PreparedArchiveTable mainTable, List<PreparedArchiveTable> childTables,
+        private PreparedArchive(List<PreparedArchiveTable> mainTables, List<PreparedArchiveTable> childTables,
             Map<String, List<PreparedArchiveTable>> childrenByParentNodeId, long totalRows) {
-            this.mainTable = mainTable;
+            this.mainTables = mainTables;
             this.childTables = childTables;
             this.childrenByParentNodeId = childrenByParentNodeId;
             this.totalRows = totalRows;
@@ -875,14 +1042,15 @@ public class ArchiveEngine {
         private final String targetIdentity;
         private final String sourceSql;
         private final List<ColumnMeta> columns;
-        private final int cursorIndex;
+        private final int keyIndex;
+        private final boolean keysetPagination;
         private final String insertSql;
         private final long totalRows;
         private int[] parentRelationIndexes = new int[0];
 
         private PreparedArchiveTable(int index, ArchiveTableRequest request, QualifiedName sourceName,
             QualifiedName targetName, String sourceIdentity, String targetIdentity, String sourceSql,
-            List<ColumnMeta> columns, int cursorIndex, String insertSql, long totalRows) {
+            List<ColumnMeta> columns, int keyIndex, boolean keysetPagination, String insertSql, long totalRows) {
             this.index = index;
             this.request = request;
             this.displayName = request.getName();
@@ -892,13 +1060,14 @@ public class ArchiveEngine {
             this.targetIdentity = targetIdentity;
             this.sourceSql = sourceSql;
             this.columns = columns;
-            this.cursorIndex = cursorIndex;
+            this.keyIndex = keyIndex;
+            this.keysetPagination = keysetPagination;
             this.insertSql = insertSql;
             this.totalRows = totalRows;
         }
 
-        private ColumnMeta cursorColumn() {
-            return columns.get(cursorIndex);
+        private ColumnMeta keyColumn() {
+            return columns.get(keyIndex);
         }
     }
 

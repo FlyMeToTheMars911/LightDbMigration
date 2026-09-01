@@ -259,26 +259,47 @@ public class TaskManager implements DisposableBean {
         if (!Boolean.TRUE.equals(archive.getConfirmSourceDelete())) {
             throw new IllegalArgumentException("必须明确勾选确认：归档成功后删除源表数据");
         }
-        ArchiveTableRequest mainTable = archive.getMainTable();
-        if (mainTable == null) {
-            throw new IllegalArgumentException("主业务表归档配置不能为空");
+        List<ArchiveTableRequest> mainTables = archive.getMainTables();
+        if (mainTables == null || mainTables.isEmpty()) {
+            if (archive.getMainTable() == null) {
+                throw new IllegalArgumentException("至少需要配置一张主业务表");
+            }
+            mainTables = new ArrayList<>();
+            mainTables.add(archive.getMainTable());
         }
-        normalizeArchiveTable(mainTable, "主业务表", true);
-        mainTable.setNodeId(MigrationConstants.ARCHIVE_MAIN_NODE_ID);
-        mainTable.setParentNodeId(null);
+        archive.setMainTables(mainTables);
+        archive.setMainTable(mainTables.get(0));
         List<ArchiveTableRequest> childTables = archive.getChildTables();
         if (childTables == null) {
             childTables = new ArrayList<>();
             archive.setChildTables(childTables);
         }
-        if (childTables.size() + 1 > MigrationConstants.MAX_STEPS) {
+        if (mainTables.size() + childTables.size() > MigrationConstants.MAX_STEPS) {
             throw new IllegalArgumentException("单个任务最多支持 " + MigrationConstants.MAX_STEPS + " 张归档表");
         }
         Set<String> sourceTables = new LinkedHashSet<>();
         Set<String> targetTables = new LinkedHashSet<>();
+        Set<String> mainNodeIds = new LinkedHashSet<>();
         Map<String, ArchiveTableRequest> childByNodeId = new LinkedHashMap<>();
-        sourceTables.add(normalizeTableIdentity(mainTable.getSourceTable()));
-        targetTables.add(normalizeTableIdentity(mainTable.getTargetTable()));
+        for (int i = 0; i < mainTables.size(); i++) {
+            ArchiveTableRequest mainTable = mainTables.get(i);
+            if (mainTable == null) {
+                throw new IllegalArgumentException("第 " + (i + 1) + " 张主业务表配置不能为空");
+            }
+            String label = mainTables.size() == MigrationConstants.MIN_ARCHIVE_MAIN_TABLES ? "主业务表"
+                : "第 " + (i + 1) + " 张主业务表";
+            normalizeArchiveTable(mainTable, label, true);
+            String defaultNodeId = mainTables.size() == MigrationConstants.MIN_ARCHIVE_MAIN_TABLES
+                ? MigrationConstants.ARCHIVE_MAIN_NODE_ID : MigrationConstants.ARCHIVE_MAIN_NODE_PREFIX + (i + 1);
+            String nodeId = normalizeArchiveNodeId(mainTable.getNodeId(), defaultNodeId, label);
+            if (!mainNodeIds.add(nodeId)) {
+                throw new IllegalArgumentException("主业务表节点标识重复：" + nodeId);
+            }
+            mainTable.setNodeId(nodeId);
+            mainTable.setParentNodeId(null);
+            addArchiveTableIdentity(sourceTables, mainTable.getSourceTable(), label + "的源表");
+            addArchiveTableIdentity(targetTables, mainTable.getTargetTable(), label + "的归档表");
+        }
         for (int i = 0; i < childTables.size(); i++) {
             ArchiveTableRequest childTable = childTables.get(i);
             if (childTable == null) {
@@ -286,37 +307,44 @@ public class TaskManager implements DisposableBean {
             }
             String label = "第 " + (i + 1) + " 张子业务表";
             normalizeArchiveTable(childTable, label, false);
-            String nodeId = isBlank(childTable.getNodeId()) ? MigrationConstants.ARCHIVE_CHILD_NODE_PREFIX + (i + 1)
-                : childTable.getNodeId().trim().toUpperCase(Locale.ROOT);
-            nodeId = SqlSupport.normalizeColumnName(nodeId, label + "节点标识").toUpperCase(Locale.ROOT);
-            if (MigrationConstants.ARCHIVE_MAIN_NODE_ID.equals(nodeId)) {
-                throw new IllegalArgumentException(label + "节点标识不能使用保留值 MAIN");
+            String nodeId = normalizeArchiveNodeId(childTable.getNodeId(),
+                MigrationConstants.ARCHIVE_CHILD_NODE_PREFIX + (i + 1), label);
+            if (mainNodeIds.contains(nodeId)) {
+                throw new IllegalArgumentException(label + "节点标识与主业务表重复：" + nodeId);
             }
             if (childByNodeId.put(nodeId, childTable) != null) {
                 throw new IllegalArgumentException("从表节点标识重复：" + nodeId);
             }
             childTable.setNodeId(nodeId);
-            String parentNodeId = isBlank(childTable.getParentNodeId())
-                ? MigrationConstants.ARCHIVE_MAIN_NODE_ID
+            if (isBlank(childTable.getParentNodeId())
+                && mainTables.size() > MigrationConstants.MIN_ARCHIVE_MAIN_TABLES) {
+                throw new IllegalArgumentException(label + "存在多张主业务表时必须明确选择上级节点");
+            }
+            String parentNodeId = isBlank(childTable.getParentNodeId()) ? mainTables.get(0).getNodeId()
                 : childTable.getParentNodeId().trim().toUpperCase(Locale.ROOT);
             childTable.setParentNodeId(SqlSupport.normalizeColumnName(parentNodeId, label + "上级节点标识")
                 .toUpperCase(Locale.ROOT));
-            String sourceIdentity = normalizeTableIdentity(childTable.getSourceTable());
-            String targetIdentity = normalizeTableIdentity(childTable.getTargetTable());
-            if (!sourceTables.add(sourceIdentity)) {
-                throw new IllegalArgumentException(label + "的源表重复配置：" + childTable.getSourceTable());
-            }
-            if (!targetTables.add(targetIdentity)) {
-                throw new IllegalArgumentException(label + "的归档表重复配置：" + childTable.getTargetTable());
-            }
+            addArchiveTableIdentity(sourceTables, childTable.getSourceTable(), label + "的源表");
+            addArchiveTableIdentity(targetTables, childTable.getTargetTable(), label + "的归档表");
         }
         Set<String> overlap = new LinkedHashSet<>(sourceTables);
         overlap.retainAll(targetTables);
         if (!overlap.isEmpty()) {
             throw new IllegalArgumentException("源表不能同时作为任一归档目标表：" + overlap.iterator().next());
         }
-        archive.setChildTables(sortArchiveChildren(childTables, childByNodeId));
+        archive.setChildTables(sortArchiveChildren(childTables, childByNodeId, mainNodeIds));
         request.setSteps(Collections.<MigrationStepRequest>emptyList());
+    }
+
+    private String normalizeArchiveNodeId(String configuredNodeId, String defaultNodeId, String label) {
+        String nodeId = isBlank(configuredNodeId) ? defaultNodeId : configuredNodeId.trim().toUpperCase(Locale.ROOT);
+        return SqlSupport.normalizeColumnName(nodeId, label + "节点标识").toUpperCase(Locale.ROOT);
+    }
+
+    private void addArchiveTableIdentity(Set<String> identities, String tableName, String label) {
+        if (!identities.add(normalizeTableIdentity(tableName))) {
+            throw new IllegalArgumentException(label + "重复配置：" + tableName);
+        }
     }
 
     private void normalizeArchiveTable(ArchiveTableRequest table, String defaultName, boolean mainTable) {
@@ -330,7 +358,12 @@ public class TaskManager implements DisposableBean {
         if (normalizeTableIdentity(table.getSourceTable()).equals(normalizeTableIdentity(table.getTargetTable()))) {
             throw new IllegalArgumentException(defaultName + "的源表与归档表不能相同");
         }
-        table.setCursorColumn(SqlSupport.normalizeColumnName(table.getCursorColumn(), defaultName + "唯一游标字段"));
+        if (isBlank(table.getCursorColumn())) {
+            table.setCursorColumn(null);
+        } else {
+            table.setCursorColumn(SqlSupport.normalizeColumnName(table.getCursorColumn(),
+                defaultName + "唯一游标字段"));
+        }
         if (mainTable) {
             table.setSourceSql(SqlSupport.normalizeSourceQuery(table.getSourceSql()));
             table.setRelations(Collections.<ArchiveRelationRequest>emptyList());
@@ -362,18 +395,18 @@ public class TaskManager implements DisposableBean {
     }
 
     private List<ArchiveTableRequest> sortArchiveChildren(List<ArchiveTableRequest> childTables,
-        Map<String, ArchiveTableRequest> childByNodeId) {
+        Map<String, ArchiveTableRequest> childByNodeId, Set<String> mainNodeIds) {
         List<ArchiveTableRequest> sorted = new ArrayList<>();
         Set<String> visiting = new LinkedHashSet<>();
         Set<String> visited = new LinkedHashSet<>();
         for (ArchiveTableRequest childTable : childTables) {
-            visitArchiveNode(childTable, childByNodeId, visiting, visited, sorted);
+            visitArchiveNode(childTable, childByNodeId, mainNodeIds, visiting, visited, sorted);
         }
         return sorted;
     }
 
     private void visitArchiveNode(ArchiveTableRequest childTable, Map<String, ArchiveTableRequest> childByNodeId,
-        Set<String> visiting, Set<String> visited, List<ArchiveTableRequest> sorted) {
+        Set<String> mainNodeIds, Set<String> visiting, Set<String> visited, List<ArchiveTableRequest> sorted) {
         String nodeId = childTable.getNodeId();
         if (visited.contains(nodeId)) {
             return;
@@ -382,13 +415,13 @@ public class TaskManager implements DisposableBean {
             throw new IllegalArgumentException("归档从表关系存在循环，涉及节点：" + nodeId);
         }
         String parentNodeId = childTable.getParentNodeId();
-        if (!MigrationConstants.ARCHIVE_MAIN_NODE_ID.equals(parentNodeId)) {
+        if (!mainNodeIds.contains(parentNodeId)) {
             ArchiveTableRequest parent = childByNodeId.get(parentNodeId);
             if (parent == null) {
                 throw new IllegalArgumentException("归档从表节点 " + nodeId + " 的上级节点不存在："
                     + parentNodeId);
             }
-            visitArchiveNode(parent, childByNodeId, visiting, visited, sorted);
+            visitArchiveNode(parent, childByNodeId, mainNodeIds, visiting, visited, sorted);
         }
         visiting.remove(nodeId);
         visited.add(nodeId);

@@ -24,6 +24,9 @@ public final class ArchiveGraphValidationCheck {
         try {
             Method validateRequest = TaskManager.class.getDeclaredMethod("validateRequest", CreateTaskRequest.class);
             validateRequest.setAccessible(true);
+            verifyBlankCursorAccepted(taskManager, validateRequest);
+            verifyMultipleMainTablesAccepted(taskManager, validateRequest);
+            verifyBackendSqlLogBoundary(taskManager, validateRequest);
             verifyTopologicalSort(taskManager, validateRequest);
             verifyCycleRejected(taskManager, validateRequest);
             verifyMissingParentRejected(taskManager, validateRequest);
@@ -31,6 +34,54 @@ public final class ArchiveGraphValidationCheck {
         } finally {
             taskManager.destroy();
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void verifyBackendSqlLogBoundary(TaskManager taskManager, Method validateRequest)
+        throws Exception {
+        CreateTaskRequest request = baseRequest();
+        invoke(taskManager, validateRequest, request);
+        MigrationTask task = new MigrationTask("backend-sql-boundary", request);
+        task.backendSql("SQL执行[边界验证]：SELECT 1；参数=[]");
+        List<java.util.Map<String, Object>> logs = (List<java.util.Map<String, Object>>)task.snapshot(true, 0L)
+            .get("logs");
+        for (java.util.Map<String, Object> log : logs) {
+            if (String.valueOf(log.get("message")).contains("SQL执行[")) {
+                throw new AssertionError("后台SQL被错误加入前端任务日志");
+            }
+        }
+        System.out.println("ARCHIVE_SQL_BACKEND_ONLY_BOUNDARY_PASSED");
+    }
+
+    private static void verifyMultipleMainTablesAccepted(TaskManager taskManager, Method validateRequest)
+        throws Exception {
+        CreateTaskRequest request = baseRequest();
+        ArchiveTableRequest firstMain = request.getArchive().getMainTable();
+        firstMain.setNodeId("ROOT_A");
+        ArchiveTableRequest secondMain = main("ROOT_B", "GRAPH_MAIN_B", "GRAPH_MAIN_B_H");
+        request.getArchive().setMainTables(Arrays.asList(firstMain, secondMain));
+        ArchiveTableRequest child = child("C1", "ROOT_B", "GRAPH_CHILD_B", "GRAPH_CHILD_B_H",
+            "MAIN_ID", "ID");
+        request.getArchive().setChildTables(Collections.singletonList(child));
+        invoke(taskManager, validateRequest, request);
+        List<ArchiveTableRequest> mainTables = request.getArchive().getMainTables();
+        if (mainTables.size() != 2 || !"ROOT_A".equals(mainTables.get(0).getNodeId())
+            || !"ROOT_B".equals(mainTables.get(1).getNodeId()) || !"ROOT_B".equals(child.getParentNodeId())) {
+            throw new AssertionError("多主业务表节点或从表归属关系未保留");
+        }
+        System.out.println("ARCHIVE_MULTIPLE_MAIN_TABLES_VALIDATION_PASSED");
+    }
+
+    private static void verifyBlankCursorAccepted(TaskManager taskManager, Method validateRequest) throws Exception {
+        CreateTaskRequest request = baseRequest();
+        ArchiveTableRequest child = child("C1", MigrationConstants.ARCHIVE_MAIN_NODE_ID,
+            "BLANK_CURSOR_CHILD", "BLANK_CURSOR_CHILD_H", "MAIN_ID", "ID");
+        request.getArchive().setChildTables(Collections.singletonList(child));
+        invoke(taskManager, validateRequest, request);
+        if (request.getArchive().getMainTable().getCursorColumn() != null || child.getCursorColumn() != null) {
+            throw new AssertionError("归档任务创建阶段不应强制填写唯一游标字段");
+        }
+        System.out.println("ARCHIVE_BLANK_CURSOR_REQUEST_PASSED");
     }
 
     private static void verifyTopologicalSort(TaskManager taskManager, Method validateRequest) throws Exception {
@@ -75,12 +126,7 @@ public final class ArchiveGraphValidationCheck {
         database.setUsername("validation_user");
         database.setPassword("validation_only");
 
-        ArchiveTableRequest mainTable = new ArchiveTableRequest();
-        mainTable.setName("主业务表");
-        mainTable.setSourceTable("GRAPH_MAIN");
-        mainTable.setTargetTable("GRAPH_MAIN_H");
-        mainTable.setCursorColumn("ID");
-        mainTable.setSourceSql("SELECT ID FROM GRAPH_MAIN");
+        ArchiveTableRequest mainTable = main(null, "GRAPH_MAIN", "GRAPH_MAIN_H");
 
         ArchiveRequest archive = new ArchiveRequest();
         archive.setConfirmSourceDelete(Boolean.TRUE);
@@ -97,6 +143,17 @@ public final class ArchiveGraphValidationCheck {
         return request;
     }
 
+    private static ArchiveTableRequest main(String nodeId, String sourceTable, String targetTable) {
+        ArchiveTableRequest mainTable = new ArchiveTableRequest();
+        mainTable.setName(nodeId == null ? "主业务表" : nodeId);
+        mainTable.setNodeId(nodeId);
+        mainTable.setSourceTable(sourceTable);
+        mainTable.setTargetTable(targetTable);
+        mainTable.setCursorColumn(null);
+        mainTable.setSourceSql("SELECT ID FROM " + sourceTable);
+        return mainTable;
+    }
+
     private static ArchiveTableRequest child(String nodeId, String parentNodeId, String sourceTable,
         String targetTable, String childColumn, String parentColumn) {
         ArchiveRelationRequest relation = new ArchiveRelationRequest();
@@ -108,7 +165,7 @@ public final class ArchiveGraphValidationCheck {
         child.setParentNodeId(parentNodeId);
         child.setSourceTable(sourceTable);
         child.setTargetTable(targetTable);
-        child.setCursorColumn("ID");
+        child.setCursorColumn(null);
         child.setRelations(Collections.singletonList(relation));
         return child;
     }
