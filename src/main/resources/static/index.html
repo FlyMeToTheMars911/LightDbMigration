@@ -219,7 +219,7 @@
         <label>主表归档范围查询 SQL
             <textarea class="archive-main-sql" rows="7" spellcheck="false" placeholder="SELECT * FROM BUSINESS_MAIN WHERE CREATED_AT &lt; '2025-01-01'"></textarea>
         </label>
-        <div class="field-help">查询必须返回主业务源表的全部字段。填写后按递增游标做 Keyset 分页；留空时单列主键只用于稳定排序和精确删除，归档后重复读取当前首批，不假设主键递增。</div>
+        <div class="field-help">查询必须返回主业务源表的全部字段。填写后按递增游标做 Keyset 分页；留空时完整主键（含复合主键）只用于稳定排序和精确删除，归档后重复读取当前首批，不假设主键递增。</div>
     </article>
 </template>
 
@@ -240,7 +240,7 @@
         <label>与上级表的关联字段映射
             <input class="archive-child-relations" type="text" placeholder="例如 PARENT_ID=ID；复合关联用逗号分隔：TENANT_ID=TENANT_ID, PARENT_ID=ID">
         </label>
-        <div class="field-help">等号左侧是本表字段，右侧是所选上级表字段。工具按有向关系逐层查询；归档表父节点先写、源表子节点先删。</div>
+        <div class="field-help">等号左侧是本表字段，右侧是所选上级表字段。工具按有向关系逐层查询；归档表父节点先写、源表子节点先删。子表游标留空时同样支持按完整复合主键排序和精确删除。</div>
     </article>
 </template>
 

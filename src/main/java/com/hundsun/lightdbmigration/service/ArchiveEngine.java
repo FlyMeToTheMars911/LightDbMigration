@@ -41,6 +41,7 @@ public class ArchiveEngine {
     private static final String PARENT_ALIAS = "LM_PARENT";
     private static final String CHILD_ALIAS = "LM_CHILD";
     private static final String PAGE_ALIAS = "LM_ARCHIVE_PAGE";
+    private static final int SINGLE_COLUMN_KEY_SIZE = 1;
     private static final int MAX_SQL_LOG_PARAMETERS = 50;
     private static final int MAX_SQL_LOG_VALUE_LENGTH = 160;
 
@@ -164,15 +165,22 @@ public class ArchiveEngine {
         validateQueryCoversSourceTable(queryColumns, sourceTableColumns, request.getName());
         boolean keysetPagination = request.getCursorColumn() != null
             && !request.getCursorColumn().trim().isEmpty();
-        String keyColumn = resolveArchiveKeyColumn(task, connection, request, sourceName, sourceTableColumns,
+        List<String> keyColumnNames = resolveArchiveKeyColumns(task, connection, request, sourceName,
+            sourceTableColumns,
             queryColumns, databaseType, keysetPagination);
-        String keyLabel = keysetPagination ? "唯一游标字段" : "单列主键删除键";
-        int keyIndex = resolveColumnIndex(keyColumn, queryColumns, request.getName() + keyLabel);
-        long totalRows = countAndValidateArchiveKey(task, connection, sourceSql, queryColumns.get(keyIndex),
-            databaseType, request.getName(), keyLabel);
+        String keyLabel = keysetPagination ? "唯一游标字段" : "主键删除键";
+        List<Integer> keyIndexes = new ArrayList<>();
+        List<ColumnMeta> keyColumns = new ArrayList<>();
+        for (String keyColumnName : keyColumnNames) {
+            int keyIndex = resolveColumnIndex(keyColumnName, queryColumns, request.getName() + keyLabel);
+            keyIndexes.add(keyIndex);
+            keyColumns.add(queryColumns.get(keyIndex));
+        }
+        long totalRows = countAndValidateArchiveKeys(task, connection, sourceSql, keyColumns,
+            databaseType, request.getName(), keyLabel, keysetPagination);
         String insertSql = buildInsertSql(targetName, queryColumns, databaseType);
         return new PreparedArchiveTable(index, request, sourceName, targetName, sourceIdentity, targetIdentity,
-            sourceSql, queryColumns, keyIndex, keysetPagination, insertSql, totalRows);
+            sourceSql, queryColumns, keyIndexes, keyColumns, keysetPagination, insertSql, totalRows);
     }
 
     private void archiveAllMainTables(MigrationTask task, Connection connection, PreparedArchive prepared,
@@ -202,7 +210,7 @@ public class ArchiveEngine {
             QueryWithParameters mainPage = mainTable.keysetPagination
                 ? buildPageSql(mainTable.sourceSql, mainTable.keyColumn(), databaseType, batchSize,
                     new ArrayList<Object>(), lastKey, upperBound)
-                : buildCurrentFirstPageSql(mainTable.sourceSql, mainTable.keyColumn(), databaseType, batchSize,
+                : buildCurrentFirstPageSql(mainTable.sourceSql, mainTable.keyColumns, databaseType, batchSize,
                     new ArrayList<Object>());
             List<Object[]> mainRows = queryRows(task, connection, mainPage, mainTable.columns, batchSize);
             if (mainRows.isEmpty()) {
@@ -213,7 +221,7 @@ public class ArchiveEngine {
             }
             Object currentLastKey = null;
             if (mainTable.keysetPagination) {
-                currentLastKey = mainRows.get(mainRows.size() - 1)[mainTable.keyIndex];
+                currentLastKey = mainRows.get(mainRows.size() - 1)[mainTable.keyIndex()];
                 if (lastKey != null && cursorValuesEqual(lastKey, currentLastKey)) {
                     throw new IllegalStateException("主业务表 " + mainTable.displayName + " 游标未推进，请检查字段 "
                         + mainTable.keyColumn().name);
@@ -297,7 +305,7 @@ public class ArchiveEngine {
             QueryWithParameters childPage = childTable.keysetPagination
                 ? buildPageSql(relationQuery.sql, childTable.keyColumn(), databaseType, batchSize,
                     relationQuery.parameters, lastKey, upperBound)
-                : buildCurrentFirstPageSql(relationQuery.sql, childTable.keyColumn(), databaseType, batchSize,
+                : buildCurrentFirstPageSql(relationQuery.sql, childTable.keyColumns, databaseType, batchSize,
                     relationQuery.parameters);
             List<Object[]> childRows = queryRows(task, connection, childPage, childTable.columns, batchSize);
             if (childRows.isEmpty()) {
@@ -305,7 +313,7 @@ public class ArchiveEngine {
             }
             Object currentLastKey = null;
             if (childTable.keysetPagination) {
-                currentLastKey = childRows.get(childRows.size() - 1)[childTable.keyIndex];
+                currentLastKey = childRows.get(childRows.size() - 1)[childTable.keyIndex()];
                 if (lastKey != null && cursorValuesEqual(lastKey, currentLastKey)) {
                     throw new IllegalStateException("子业务表 " + childTable.displayName + " 游标未推进");
                 }
@@ -431,19 +439,35 @@ public class ArchiveEngine {
 
     private long deleteRows(MigrationTask task, Connection connection, PreparedArchiveTable table,
         List<Object[]> rows, String databaseType) throws Exception {
-        String quotedKey = SqlSupport.quoteIdentifier(table.keyColumn().name, databaseType);
-        String sql = "DELETE FROM " + quoteQualifiedName(table.sourceName, databaseType) + " WHERE " + quotedKey
-            + " IN (" + placeholders(rows.size()) + ")";
+        List<String> quotedKeys = new ArrayList<>();
+        for (ColumnMeta keyColumn : table.keyColumns) {
+            quotedKeys.add(SqlSupport.quoteIdentifier(keyColumn.name, databaseType));
+        }
+        String keyPredicate;
+        if (quotedKeys.size() == SINGLE_COLUMN_KEY_SIZE) {
+            keyPredicate = quotedKeys.get(0) + " IN (" + placeholders(rows.size()) + ")";
+        } else {
+            keyPredicate = "(" + join(quotedKeys, ", ") + ") IN ("
+                + rowPlaceholders(rows.size(), quotedKeys.size()) + ")";
+        }
+        String sql = "DELETE FROM " + quoteQualifiedName(table.sourceName, databaseType) + " WHERE "
+            + keyPredicate;
         List<Object> parameters = new ArrayList<>();
         for (Object[] row : rows) {
-            parameters.add(row[table.keyIndex]);
+            for (Integer keyIndex : table.keyIndexes) {
+                parameters.add(row[keyIndex]);
+            }
         }
         logSql(task, "源表删除 " + table.displayName, sql, parameters);
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             task.setCurrentStatement(statement);
             try {
-                for (int i = 0; i < rows.size(); i++) {
-                    setStatementValue(statement, i + 1, rows.get(i)[table.keyIndex], table.keyColumn().jdbcType);
+                int parameterIndex = 1;
+                for (Object[] row : rows) {
+                    for (int i = 0; i < table.keyIndexes.size(); i++) {
+                        setStatementValue(statement, parameterIndex++, row[table.keyIndexes.get(i)],
+                            table.keyColumns.get(i).jdbcType);
+                    }
                 }
                 return statement.executeUpdate();
             } finally {
@@ -491,11 +515,15 @@ public class ArchiveEngine {
         return new QueryWithParameters(sql, parameters);
     }
 
-    private QueryWithParameters buildCurrentFirstPageSql(String sourceSql, ColumnMeta keyColumn,
+    private QueryWithParameters buildCurrentFirstPageSql(String sourceSql, List<ColumnMeta> keyColumns,
         String databaseType, int batchSize, List<Object> sourceParameters) {
-        String quotedKey = SqlSupport.quoteIdentifier(keyColumn.name, databaseType);
+        List<String> orderByColumns = new ArrayList<>();
+        for (ColumnMeta keyColumn : keyColumns) {
+            orderByColumns.add(PAGE_ALIAS + "." + SqlSupport.quoteIdentifier(keyColumn.name, databaseType)
+                + " ASC");
+        }
         String ordered = "SELECT " + PAGE_ALIAS + ".* FROM (" + sourceSql + ") " + PAGE_ALIAS + " ORDER BY "
-            + PAGE_ALIAS + "." + quotedKey + " ASC";
+            + join(orderByColumns, ", ");
         String sql = MigrationConstants.DB_MYSQL.equals(databaseType) ? ordered + " LIMIT " + batchSize
             : "SELECT * FROM (" + ordered + ") WHERE ROWNUM <= " + batchSize;
         return new QueryWithParameters(sql, new ArrayList<>(sourceParameters));
@@ -526,33 +554,34 @@ public class ArchiveEngine {
         return readQueryColumns(task, connection, sql);
     }
 
-    private String resolveArchiveKeyColumn(MigrationTask task, Connection connection, ArchiveTableRequest request,
+    private List<String> resolveArchiveKeyColumns(MigrationTask task, Connection connection,
+        ArchiveTableRequest request,
         QualifiedName sourceName, List<ColumnMeta> sourceColumns, List<ColumnMeta> queryColumns, String databaseType,
         boolean keysetPagination) throws SQLException {
         String configuredCursor = request.getCursorColumn();
-        String resolvedCursor;
+        List<String> resolvedKeys = new ArrayList<>();
         if (!keysetPagination) {
             List<String> primaryKeyColumns = readPrimaryKeyColumns(connection, sourceName, databaseType);
             if (primaryKeyColumns.isEmpty()) {
                 throw new IllegalArgumentException(request.getName() + "未配置唯一游标字段，且源表 "
-                    + sourceName.toSql() + " 未检测到主键；无游标模式需要单列主键作为精确删除键");
+                    + sourceName.toSql() + " 未检测到主键；无游标模式需要主键作为精确删除键");
             }
-            if (primaryKeyColumns.size() != 1) {
-                throw new IllegalArgumentException(request.getName() + "未配置唯一游标字段，且源表 "
-                    + sourceName.toSql() + " 使用 " + primaryKeyColumns.size()
-                    + " 列复合主键；无游标模式当前仅支持单列主键，请手工填写递增唯一游标字段");
-            }
-            resolvedCursor = primaryKeyColumns.get(0);
-            task.info(request.getName() + "未配置递增唯一游标字段；单列主键 " + resolvedCursor
-                + " 仅用于稳定排序和精确删除，将采用删除后重复读取当前首批的非游标模式");
+            resolvedKeys.addAll(primaryKeyColumns);
+            task.info(request.getName() + "未配置递增唯一游标字段；主键 ["
+                + join(resolvedKeys, ", ") + "] 共 " + resolvedKeys.size()
+                + " 列，仅用于稳定排序和精确删除，将采用删除后重复读取当前首批的非游标模式");
         } else {
-            resolvedCursor = SqlSupport.normalizeColumnName(configuredCursor, request.getName() + "唯一游标字段");
+            String resolvedCursor = SqlSupport.normalizeColumnName(configuredCursor,
+                request.getName() + "唯一游标字段");
             request.setCursorColumn(resolvedCursor);
+            resolvedKeys.add(resolvedCursor);
         }
-        String keyLabel = keysetPagination ? "唯一游标字段" : "单列主键删除键";
-        resolveColumnIndex(resolvedCursor, sourceColumns, request.getName() + "源表" + keyLabel);
-        resolveColumnIndex(resolvedCursor, queryColumns, request.getName() + "归档查询" + keyLabel);
-        return resolvedCursor;
+        String keyLabel = keysetPagination ? "唯一游标字段" : "主键删除键";
+        for (String resolvedKey : resolvedKeys) {
+            resolveColumnIndex(resolvedKey, sourceColumns, request.getName() + "源表" + keyLabel);
+            resolveColumnIndex(resolvedKey, queryColumns, request.getName() + "归档查询" + keyLabel);
+        }
+        return resolvedKeys;
     }
 
     private List<String> readPrimaryKeyColumns(Connection connection, QualifiedName tableName, String databaseType)
@@ -660,12 +689,18 @@ public class ArchiveEngine {
             && left.nullable == right.nullable;
     }
 
-    private long countAndValidateArchiveKey(MigrationTask task, Connection connection, String sourceSql,
-        ColumnMeta keyColumn, String databaseType, String displayName, String keyLabel) throws Exception {
-        String quotedKey = SqlSupport.quoteIdentifier(keyColumn.name, databaseType);
-        String reference = "LM_ARCHIVE_STATS." + quotedKey;
-        String sql = "SELECT COUNT(*), COUNT(" + reference + "), COUNT(DISTINCT " + reference + ") FROM ("
-            + sourceSql + ") LM_ARCHIVE_STATS";
+    private long countAndValidateArchiveKeys(MigrationTask task, Connection connection, String sourceSql,
+        List<ColumnMeta> keyColumns, String databaseType, String displayName, String keyLabel,
+        boolean keysetPagination) throws Exception {
+        StringBuilder sqlBuilder = new StringBuilder("SELECT COUNT(*)");
+        for (ColumnMeta keyColumn : keyColumns) {
+            String reference = "LM_ARCHIVE_STATS." + SqlSupport.quoteIdentifier(keyColumn.name, databaseType);
+            sqlBuilder.append(", COUNT(").append(reference).append(')');
+            if (keysetPagination) {
+                sqlBuilder.append(", COUNT(DISTINCT ").append(reference).append(')');
+            }
+        }
+        String sql = sqlBuilder.append(" FROM (").append(sourceSql).append(") LM_ARCHIVE_STATS").toString();
         logSql(task, "归档范围统计", sql, java.util.Collections.<Object>emptyList());
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             task.setCurrentStatement(statement);
@@ -674,15 +709,20 @@ public class ArchiveEngine {
                     throw new SQLException("归档统计查询未返回结果");
                 }
                 long totalRows = resultSet.getLong(1);
-                long nonNullRows = resultSet.getLong(2);
-                long distinctRows = resultSet.getLong(3);
-                if (nonNullRows != totalRows) {
-                    throw new IllegalArgumentException(displayName + keyLabel + " " + keyColumn.name
-                        + " 存在空值");
-                }
-                if (distinctRows != totalRows) {
-                    throw new IllegalArgumentException(displayName + keyLabel + " " + keyColumn.name
-                        + " 在本次归档范围内不唯一");
+                int resultIndex = 2;
+                for (ColumnMeta keyColumn : keyColumns) {
+                    long nonNullRows = resultSet.getLong(resultIndex++);
+                    if (nonNullRows != totalRows) {
+                        throw new IllegalArgumentException(displayName + keyLabel + " " + keyColumn.name
+                            + " 存在空值");
+                    }
+                    if (keysetPagination) {
+                        long distinctRows = resultSet.getLong(resultIndex++);
+                        if (distinctRows != totalRows) {
+                            throw new IllegalArgumentException(displayName + keyLabel + " " + keyColumn.name
+                                + " 在本次归档范围内不唯一");
+                        }
+                    }
                 }
                 return totalRows;
             } finally {
@@ -939,6 +979,18 @@ public class ArchiveEngine {
         return result.toString();
     }
 
+    private String rowPlaceholders(int rowCount, int columnCount) {
+        StringBuilder result = new StringBuilder();
+        String rowPlaceholder = "(" + placeholders(columnCount) + ")";
+        for (int i = 0; i < rowCount; i++) {
+            if (i > 0) {
+                result.append(", ");
+            }
+            result.append(rowPlaceholder);
+        }
+        return result.toString();
+    }
+
     private String join(List<String> values, String delimiter) {
         StringBuilder result = new StringBuilder();
         for (int i = 0; i < values.size(); i++) {
@@ -1042,7 +1094,8 @@ public class ArchiveEngine {
         private final String targetIdentity;
         private final String sourceSql;
         private final List<ColumnMeta> columns;
-        private final int keyIndex;
+        private final List<Integer> keyIndexes;
+        private final List<ColumnMeta> keyColumns;
         private final boolean keysetPagination;
         private final String insertSql;
         private final long totalRows;
@@ -1050,7 +1103,8 @@ public class ArchiveEngine {
 
         private PreparedArchiveTable(int index, ArchiveTableRequest request, QualifiedName sourceName,
             QualifiedName targetName, String sourceIdentity, String targetIdentity, String sourceSql,
-            List<ColumnMeta> columns, int keyIndex, boolean keysetPagination, String insertSql, long totalRows) {
+            List<ColumnMeta> columns, List<Integer> keyIndexes, List<ColumnMeta> keyColumns,
+            boolean keysetPagination, String insertSql, long totalRows) {
             this.index = index;
             this.request = request;
             this.displayName = request.getName();
@@ -1060,14 +1114,19 @@ public class ArchiveEngine {
             this.targetIdentity = targetIdentity;
             this.sourceSql = sourceSql;
             this.columns = columns;
-            this.keyIndex = keyIndex;
+            this.keyIndexes = keyIndexes;
+            this.keyColumns = keyColumns;
             this.keysetPagination = keysetPagination;
             this.insertSql = insertSql;
             this.totalRows = totalRows;
         }
 
         private ColumnMeta keyColumn() {
-            return columns.get(keyIndex);
+            return keyColumns.get(0);
+        }
+
+        private int keyIndex() {
+            return keyIndexes.get(0);
         }
     }
 

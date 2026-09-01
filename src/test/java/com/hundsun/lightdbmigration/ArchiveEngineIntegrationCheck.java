@@ -35,6 +35,8 @@ public final class ArchiveEngineIntegrationCheck {
     private static final String CHILD_THREE_TARGET = "LDM_ARC_IT_CHILD3_H";
     private static final String UUID_SOURCE = "LDM_ARC_IT_UUID_S";
     private static final String UUID_TARGET = "LDM_ARC_IT_UUID_H";
+    private static final String COMPOSITE_SOURCE = "LDM_ARC_IT_COMPOSITE_S";
+    private static final String COMPOSITE_TARGET = "LDM_ARC_IT_COMPOSITE_H";
     private static final String ARCHIVE_NAME_PREFIX = "ARCHIVE_";
     private static final String TEST_CURSOR_COLUMN = "ID";
     private static final String EXPLICIT_CURSOR_CHILD_NODE_ID = "CHILD_3";
@@ -92,6 +94,8 @@ public final class ArchiveEngineIntegrationCheck {
         assertCount(verificationConnection, CHILD_THREE_TARGET, 0L);
         assertCount(verificationConnection, UUID_SOURCE, 3L);
         assertCount(verificationConnection, UUID_TARGET, 0L);
+        assertCount(verificationConnection, COMPOSITE_SOURCE, 3L);
+        assertCount(verificationConnection, COMPOSITE_TARGET, 0L);
         executeUpdate(verificationConnection, "DELETE FROM " + MAIN_TARGET + " WHERE ID = 101");
         System.out.println("EXPECTED_DUPLICATE_ROLLBACK_PASSED");
     }
@@ -115,24 +119,30 @@ public final class ArchiveEngineIntegrationCheck {
         assertCount(verificationConnection, CHILD_THREE_TARGET, 2L);
         assertScalar(verificationConnection, "SELECT ID FROM " + MAIN_SOURCE, 201L);
         assertScalar(verificationConnection, "SELECT MAIN_ID FROM " + CHILD_ONE_SOURCE, 201L);
-        assertScalar(verificationConnection, "SELECT ID FROM " + CHILD_TWO_SOURCE, 2003L);
+        assertScalar(verificationConnection, "SELECT CHILD1_ID FROM " + CHILD_TWO_SOURCE, 1003L);
         assertScalar(verificationConnection, "SELECT ID FROM " + CHILD_THREE_SOURCE, 3001L);
         assertCount(verificationConnection, UUID_SOURCE, 1L);
         assertCount(verificationConnection, UUID_TARGET, 2L);
         assertText(verificationConnection, "SELECT ID FROM " + UUID_SOURCE,
             "7c9e6679-7425-40de-944b-e07fc1f90ae7");
+        assertCount(verificationConnection, COMPOSITE_SOURCE, 1L);
+        assertCount(verificationConnection, COMPOSITE_TARGET, 2L);
+        assertScalar(verificationConnection, "SELECT RECORD_NO FROM " + COMPOSITE_SOURCE, 3L);
         assertSqlNotExposedInTaskLogs(task);
+        System.out.println("MAIN_AND_CHILD_COMPOSITE_PRIMARY_KEY_NON_CURSOR_ARCHIVE_PASSED");
         System.out.println("MULTIPLE_MAIN_TABLES_AND_DIRECTED_CHILD_GRAPH_ARCHIVE_PASSED");
     }
 
     private static void assertPaginationModesPreserved(MigrationTask task) {
         ArchiveRequest archive = task.getRequest().getArchive();
         List<ArchiveTableRequest> mainTables = archive.getMainTables();
-        if (mainTables.size() != 2 || !TEST_CURSOR_COLUMN.equalsIgnoreCase(mainTables.get(0).getCursorColumn())) {
+        if (mainTables.size() != 3 || !TEST_CURSOR_COLUMN.equalsIgnoreCase(mainTables.get(0).getCursorColumn())) {
             throw new AssertionError("第一张主业务表显式游标配置未保留");
         }
-        if (mainTables.get(1).getCursorColumn() != null) {
-            throw new AssertionError("随机UUID主表空游标不应被改写为递增游标");
+        for (int i = 1; i < mainTables.size(); i++) {
+            if (mainTables.get(i).getCursorColumn() != null) {
+                throw new AssertionError(mainTables.get(i).getName() + "空游标不应被改写为递增游标");
+            }
         }
         for (ArchiveTableRequest child : archive.getChildTables()) {
             boolean explicitCursor = EXPLICIT_CURSOR_CHILD_NODE_ID.equals(child.getNodeId());
@@ -164,7 +174,11 @@ public final class ArchiveEngineIntegrationCheck {
         ArchiveTableRequest uuidMain = table("随机UUID主表", UUID_SOURCE, UUID_TARGET, null,
             "SELECT ID, NAME FROM " + UUID_SOURCE + " WHERE NAME LIKE '" + ARCHIVE_NAME_PREFIX + "%'");
         uuidMain.setNodeId("MAIN_2");
-        archive.setMainTables(Arrays.asList(businessMain, uuidMain));
+        ArchiveTableRequest compositeMain = table("三列复合主键主表", COMPOSITE_SOURCE, COMPOSITE_TARGET, null,
+            "SELECT TENANT_ID, BIZ_GROUP, RECORD_NO, NAME FROM " + COMPOSITE_SOURCE
+                + " WHERE NAME LIKE '" + ARCHIVE_NAME_PREFIX + "%'");
+        compositeMain.setNodeId("MAIN_3");
+        archive.setMainTables(Arrays.asList(businessMain, uuidMain, compositeMain));
         archive.setMainTable(businessMain);
         List<ArchiveTableRequest> children = new ArrayList<>();
         ArchiveTableRequest childOne = table("主键关联子表", CHILD_ONE_SOURCE, CHILD_ONE_TARGET, null, null);
@@ -232,7 +246,8 @@ public final class ArchiveEngineIntegrationCheck {
         executeUpdate(connection, "ALTER TABLE " + CHILD_ONE_TARGET
             + " ADD CONSTRAINT FK_ARC_IT_C1_H FOREIGN KEY (MAIN_ID) REFERENCES " + MAIN_TARGET + " (ID)");
         executeUpdate(connection, "CREATE TABLE " + CHILD_TWO_SOURCE
-            + " (ID BIGINT NOT NULL, CHILD1_ID BIGINT NOT NULL, NOTE_VALUE VARCHAR(64) NOT NULL, PRIMARY KEY (ID),"
+            + " (CHILD1_ID BIGINT NOT NULL, SEQ_NO BIGINT NOT NULL, PART_NO BIGINT NOT NULL,"
+            + " NOTE_VALUE VARCHAR(64) NOT NULL, PRIMARY KEY (CHILD1_ID, SEQ_NO, PART_NO),"
             + " CONSTRAINT FK_ARC_IT_C2_S FOREIGN KEY (CHILD1_ID) REFERENCES " + CHILD_ONE_SOURCE + " (ID))");
         executeUpdate(connection, "CREATE TABLE " + CHILD_TWO_TARGET + " LIKE " + CHILD_TWO_SOURCE);
         executeUpdate(connection, "ALTER TABLE " + CHILD_TWO_TARGET
@@ -248,6 +263,10 @@ public final class ArchiveEngineIntegrationCheck {
         executeUpdate(connection, "CREATE TABLE " + UUID_SOURCE
             + " (ID VARCHAR(36) NOT NULL, NAME VARCHAR(64) NOT NULL, PRIMARY KEY (ID))");
         executeUpdate(connection, "CREATE TABLE " + UUID_TARGET + " LIKE " + UUID_SOURCE);
+        executeUpdate(connection, "CREATE TABLE " + COMPOSITE_SOURCE
+            + " (TENANT_ID VARCHAR(16) NOT NULL, BIZ_GROUP VARCHAR(32) NOT NULL, RECORD_NO BIGINT NOT NULL,"
+            + " NAME VARCHAR(64) NOT NULL, PRIMARY KEY (TENANT_ID, BIZ_GROUP, RECORD_NO))");
+        executeUpdate(connection, "CREATE TABLE " + COMPOSITE_TARGET + " LIKE " + COMPOSITE_SOURCE);
         System.out.println("DEDICATED_OBJECTS_CREATED");
     }
 
@@ -257,19 +276,24 @@ public final class ArchiveEngineIntegrationCheck {
         executeUpdate(connection, "INSERT INTO " + CHILD_ONE_SOURCE + " VALUES"
             + " (1001, 101, 'A'), (1002, 102, 'B'), (1003, 201, 'KEEP')");
         executeUpdate(connection, "INSERT INTO " + CHILD_TWO_SOURCE + " VALUES"
-            + " (2001, 1001, 'A'), (2002, 1002, 'B'), (2003, 1003, 'KEEP')");
+            + " (1001, 1, 1, 'A'), (1002, 1, 1, 'B'), (1003, 1, 1, 'KEEP')");
         executeUpdate(connection, "INSERT INTO " + CHILD_THREE_SOURCE + " VALUES"
             + " (3001, 'T1', 'G3', 'KEEP'), (3002, 'T1', 'G1', 'A'), (3003, 'T1', 'G2', 'B')");
         executeUpdate(connection, "INSERT INTO " + UUID_SOURCE + " VALUES"
             + " ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'ARCHIVE_A'),"
             + " ('0f8fad5b-d9cb-469f-a165-70867728950e', 'ARCHIVE_B'),"
             + " ('7c9e6679-7425-40de-944b-e07fc1f90ae7', 'KEEP')");
+        executeUpdate(connection, "INSERT INTO " + COMPOSITE_SOURCE + " VALUES"
+            + " ('T1', 'G1', 1, 'ARCHIVE_A'), ('T1', 'G1', 2, 'ARCHIVE_B'),"
+            + " ('T1', 'G1', 3, 'KEEP')");
         System.out.println("DEDICATED_TEST_DATA_INSERTED");
     }
 
     private static void cleanup(Connection connection) throws Exception {
         executeUpdate(connection, "DROP TABLE IF EXISTS " + UUID_SOURCE);
         executeUpdate(connection, "DROP TABLE IF EXISTS " + UUID_TARGET);
+        executeUpdate(connection, "DROP TABLE IF EXISTS " + COMPOSITE_SOURCE);
+        executeUpdate(connection, "DROP TABLE IF EXISTS " + COMPOSITE_TARGET);
         executeUpdate(connection, "DROP TABLE IF EXISTS " + CHILD_TWO_SOURCE);
         executeUpdate(connection, "DROP TABLE IF EXISTS " + CHILD_ONE_SOURCE);
         executeUpdate(connection, "DROP TABLE IF EXISTS " + CHILD_THREE_SOURCE);
@@ -282,10 +306,10 @@ public final class ArchiveEngineIntegrationCheck {
     }
 
     private static void assertObjectsAbsent(Connection connection) throws Exception {
+        String[] tables = tableNames();
         String sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()"
-            + " AND table_name IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            + " AND table_name IN (" + placeholders(tables.length) + ")";
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
-            String[] tables = tableNames();
             for (int i = 0; i < tables.length; i++) {
                 statement.setString(i + 1, tables[i]);
             }
@@ -301,7 +325,19 @@ public final class ArchiveEngineIntegrationCheck {
 
     private static String[] tableNames() {
         return new String[] {MAIN_SOURCE, MAIN_TARGET, CHILD_ONE_SOURCE, CHILD_ONE_TARGET, CHILD_TWO_SOURCE,
-            CHILD_TWO_TARGET, CHILD_THREE_SOURCE, CHILD_THREE_TARGET, UUID_SOURCE, UUID_TARGET};
+            CHILD_TWO_TARGET, CHILD_THREE_SOURCE, CHILD_THREE_TARGET, UUID_SOURCE, UUID_TARGET, COMPOSITE_SOURCE,
+            COMPOSITE_TARGET};
+    }
+
+    private static String placeholders(int count) {
+        StringBuilder result = new StringBuilder();
+        for (int i = 0; i < count; i++) {
+            if (i > 0) {
+                result.append(", ");
+            }
+            result.append('?');
+        }
+        return result.toString();
     }
 
     private static void assertCount(Connection connection, String table, long expected) throws Exception {
