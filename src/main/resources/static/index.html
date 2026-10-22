@@ -103,8 +103,14 @@
     <section class="panel">
         <div class="section-heading">
             <div><span class="step-number">2</span><h2 id="configurationHeading">编排迁移 SQL</h2></div>
-            <button type="button" id="addStepButton" class="button secondary">＋ 添加一条 SQL</button>
+            <div class="configuration-actions">
+                <button type="button" id="importConfigButton" class="button ghost">导入配置</button>
+                <button type="button" id="exportConfigButton" class="button ghost">导出配置</button>
+                <button type="button" id="addStepButton" class="button secondary">＋ 添加一条 SQL</button>
+                <input id="configFileInput" type="file" accept=".json,application/json" class="hidden" aria-label="选择配置 JSON 文件">
+            </div>
         </div>
+        <div class="field-help configuration-help">导出当前任务的规则供现场导入；数据库连接配置不导出，导入时保留现场连接。导入会替换页面规则，不会创建或启动任务。</div>
         <div class="task-base-grid">
             <label>任务名称<input id="taskName" type="text" placeholder="例如：客户基础数据迁移"></label>
             <label>每批行数<input id="batchSize" type="number" value="1000" min="1" max="10000"></label>
@@ -244,6 +250,7 @@
     </article>
 </template>
 
+<script src="/config-transfer.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

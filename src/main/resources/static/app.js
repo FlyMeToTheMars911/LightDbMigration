@@ -7,6 +7,7 @@
     var MIN_ARCHIVE_MAIN_TABLES = 1;
     var MIN_MIGRATION_STEPS = 1;
     var MIGRATION_STEP_SELECTOR = '#stepsContainer .migration-step';
+    var TASK_TYPE_ARCHIVE = 'ARCHIVE';
 
     var state = {
         tasks: [],
@@ -47,6 +48,11 @@
             button.addEventListener('click', function () { testConnection(button.dataset.prefix, button); });
         });
         document.getElementById('addStepButton').addEventListener('click', addMigrationStep);
+        document.getElementById('exportConfigButton').addEventListener('click', exportTaskConfiguration);
+        document.getElementById('importConfigButton').addEventListener('click', function () {
+            document.getElementById('configFileInput').click();
+        });
+        document.getElementById('configFileInput').addEventListener('change', importTaskConfiguration);
         document.getElementById('taskType').addEventListener('change', updateTaskType);
         document.getElementById('addArchiveMainButton').addEventListener('click', addArchiveMain);
         document.getElementById('addArchiveChildButton').addEventListener('click', addArchiveChild);
@@ -175,6 +181,146 @@
         document.getElementById(id).value = inputValue == null ? '' : inputValue;
     }
 
+    function exportTaskConfiguration() {
+        try {
+            var taskType = value('taskType');
+            var archiveMode = taskType === TASK_TYPE_ARCHIVE;
+            var config = MigrationConfigTransfer.normalize({
+                format: MigrationConfigTransfer.FORMAT,
+                version: MigrationConfigTransfer.VERSION,
+                task: {
+                    taskType: taskType,
+                    name: value('taskName'),
+                    batchSize: Number(value('batchSize')),
+                    steps: archiveMode ? [] : collectSteps(),
+                    archive: archiveMode ? collectArchiveConfig() : null
+                }
+            });
+            var blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json;charset=utf-8' });
+            if (blob.size > MigrationConfigTransfer.MAX_FILE_BYTES) {
+                throw new Error('配置文件超过 5 MiB，请精简规则后导出');
+            }
+            var url = window.URL.createObjectURL(blob);
+            var link = document.createElement('a');
+            link.href = url;
+            link.download = (archiveMode ? 'archive' : 'migration') + '-config.json';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            window.setTimeout(function () { window.URL.revokeObjectURL(url); }, 1000);
+            logConfigurationTransfer('导出完成', config.task);
+            showToast('配置已导出，不含数据库连接配置');
+        } catch (error) {
+            console.warn('配置导出失败：' + error.message);
+            showToast('配置导出失败：' + error.message, true);
+        }
+    }
+
+    async function importTaskConfiguration() {
+        var input = document.getElementById('configFileInput');
+        var file = input.files && input.files[0];
+        if (!file) { return; }
+        var button = document.getElementById('importConfigButton');
+        setBusy(button, true, '导入中…');
+        try {
+            if (file.size > MigrationConfigTransfer.MAX_FILE_BYTES) {
+                throw new Error('配置文件超过 5 MiB，请选择较小的配置文件');
+            }
+            var text = await readConfigurationFile(file);
+            var parsed;
+            try {
+                parsed = JSON.parse(text.replace(/^\uFEFF/, ''));
+            } catch (ignored) {
+                throw new Error('文件内容不是有效的 JSON，请检查后重试');
+            }
+            var config = MigrationConfigTransfer.normalize(parsed);
+            applyTaskConfiguration(config.task);
+            logConfigurationTransfer('导入完成', config.task);
+            showToast(config.task.taskType === TASK_TYPE_ARCHIVE
+                ? '归档配置已导入，数据库连接已保留；请核对规则并重新确认备份及删除源记录'
+                : '迁移配置已导入，数据库连接已保留；请核对后创建任务');
+        } catch (error) {
+            console.warn('配置导入失败：' + error.message);
+            showToast('配置导入失败：' + error.message, true);
+        } finally {
+            input.value = '';
+            setBusy(button, false);
+        }
+    }
+
+    function readConfigurationFile(file) {
+        return new Promise(function (resolve, reject) {
+            var reader = new FileReader();
+            reader.onload = function () { resolve(reader.result); };
+            reader.onerror = function () { reject(new Error('配置文件读取失败，请重新选择文件')); };
+            reader.onabort = function () { reject(new Error('配置文件读取已取消')); };
+            reader.readAsText(file, 'UTF-8');
+        });
+    }
+
+    function applyTaskConfiguration(task) {
+        setValue('taskType', task.taskType);
+        setValue('taskName', task.name);
+        updateTaskType();
+        setValue('batchSize', task.batchSize);
+        document.getElementById('archiveConfirmDelete').checked = false;
+        if (task.taskType === TASK_TYPE_ARCHIVE) {
+            fillArchiveConfiguration(task.archive);
+        } else {
+            document.getElementById('stepsContainer').innerHTML = '';
+            task.steps.forEach(function (step) {
+                var element = addMigrationStep();
+                element.querySelector('.step-name').value = step.name;
+                element.querySelector('.target-table').value = step.targetTable;
+                element.querySelector('.cursor-column').value = step.cursorColumn;
+                element.querySelector('.insert-mode').value = step.insertMode;
+                element.querySelector('.source-sql').value = step.sourceSql;
+            });
+        }
+    }
+
+    function fillArchiveConfiguration(archive) {
+        document.getElementById('archiveChildrenContainer').innerHTML = '';
+        document.getElementById('archiveMainsContainer').innerHTML = '';
+        var nodeIds = new Map();
+        archive.mainTables.forEach(function (table) {
+            var element = addArchiveMain();
+            nodeIds.set(table.nodeId, element.dataset.nodeId);
+            fillArchiveTable(element, 'main', table);
+            element.querySelector('.archive-main-sql').value = table.sourceSql;
+        });
+        var childElements = archive.childTables.map(function (table) {
+            var element = addArchiveChild();
+            nodeIds.set(table.nodeId, element.dataset.nodeId);
+            fillArchiveTable(element, 'child', table);
+            element.querySelector('.archive-child-relations').value = table.relations.map(function (relation) {
+                return relation.childColumn + '=' + relation.mainColumn;
+            }).join(', ');
+            return element;
+        });
+        refreshArchiveParentOptions();
+        archive.childTables.forEach(function (table, index) {
+            childElements[index].querySelector('.archive-child-parent-node').value = nodeIds.get(table.parentNodeId);
+        });
+    }
+
+    function fillArchiveTable(element, kind, table) {
+        var prefix = '.archive-' + kind;
+        element.querySelector(prefix + '-name').value = table.name;
+        element.querySelector(prefix + '-source-table').value = table.sourceTable;
+        element.querySelector(prefix + '-target-table').value = table.targetTable;
+        element.querySelector(prefix + '-cursor-column').value = table.cursorColumn;
+    }
+
+    function logConfigurationTransfer(action, task) {
+        console.info('配置' + action, {
+            taskType: task.taskType,
+            stepCount: task.steps.length,
+            mainTableCount: task.archive ? task.archive.mainTables.length : 0,
+            childTableCount: task.archive ? task.archive.childTables.length : 0
+        });
+    }
+
     async function clearSavedDatabaseConfig() {
         if (!window.confirm('确认删除服务本机保存的数据库配置和密码吗？当前页面已填写内容不会清空。')) {
             return;
@@ -235,8 +381,10 @@
     function addMigrationStep() {
         var template = document.getElementById('migrationStepTemplate');
         var fragment = template.content.cloneNode(true);
+        var element = fragment.querySelector('.migration-step');
         document.getElementById('stepsContainer').appendChild(fragment);
         renumberSteps();
+        return element;
     }
 
     function removeMigrationStep(stepElement) {
@@ -266,6 +414,7 @@
         childTable.querySelector('.archive-child-node-id').value = childTable.dataset.nodeId;
         document.getElementById('archiveChildrenContainer').appendChild(fragment);
         renumberArchiveChildren();
+        return childTable;
     }
 
     function addArchiveMain() {
@@ -277,6 +426,7 @@
         mainTable.querySelector('.archive-main-node-id').value = mainTable.dataset.nodeId;
         document.getElementById('archiveMainsContainer').appendChild(fragment);
         renumberArchiveMains();
+        return mainTable;
     }
 
     function removeArchiveMain(mainElement) {

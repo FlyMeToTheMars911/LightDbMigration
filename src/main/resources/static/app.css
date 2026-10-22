@@ -55,6 +55,8 @@ button, input, select, textarea { font: inherit; }
 .section-heading h2 { margin: 0; font-size: 18px; }
 .step-number { width: 27px; height: 27px; border-radius: 50%; display: inline-grid; place-items: center; color: white; background: var(--primary); font-weight: 700; }
 .heading-note, .field-help { color: var(--muted); font-size: 12px; }
+.configuration-actions { flex-wrap: wrap; }
+.configuration-help { margin: -7px 0 16px; line-height: 1.6; }
 
 .database-grid { display: grid; grid-template-columns: minmax(0, 1fr) 72px minmax(0, 1fr); gap: 16px; align-items: stretch; }
 .database-grid.archive-mode { grid-template-columns: minmax(0, 1fr); }
