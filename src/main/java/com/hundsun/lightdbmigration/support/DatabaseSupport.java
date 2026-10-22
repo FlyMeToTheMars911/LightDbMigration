@@ -2,6 +2,9 @@ package com.hundsun.lightdbmigration.support;
 
 import com.hundsun.lightdbmigration.model.DatabaseConfig;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.DriverManager;
@@ -24,12 +27,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class DatabaseSupport {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(DatabaseSupport.class);
     private static final String MYSQL_DRIVER = "com.mysql.cj.jdbc.Driver";
     private static final String ORACLE_DRIVER = "oracle.jdbc.OracleDriver";
+    private static final String DM_DRIVER = "dm.jdbc.driver.DmDriver";
     private static final String MYSQL_URL_PREFIX = "jdbc:mysql://";
     private static final String ORACLE_URL_PREFIX = "jdbc:oracle:thin:@";
+    private static final String DM_URL_PREFIX = "jdbc:dm://";
     private static final String TEST_MYSQL_SQL = "SELECT 1";
     private static final String TEST_ORACLE_SQL = "SELECT 1 FROM DUAL";
+    private static final int MIN_PORT = 1;
+    private static final int MAX_PORT = 65535;
 
     private DatabaseSupport() {
     }
@@ -37,7 +45,9 @@ public final class DatabaseSupport {
     public static Connection open(final DatabaseConfig config) throws Exception {
         validate(config);
         final String type = normalizeType(config.getType());
-        Class.forName(MigrationConstants.DB_MYSQL.equals(type) ? MYSQL_DRIVER : ORACLE_DRIVER);
+        String driver = MigrationConstants.DB_MYSQL.equals(type) ? MYSQL_DRIVER
+            : MigrationConstants.DB_DM.equals(type) ? DM_DRIVER : ORACLE_DRIVER;
+        Class.forName(driver);
 
         final Properties properties = new Properties();
         properties.setProperty("user", config.getUsername().trim());
@@ -50,6 +60,7 @@ public final class DatabaseSupport {
         }
         DriverManager.setLoginTimeout(MigrationConstants.CONNECTION_TIMEOUT_SECONDS);
         final String jdbcUrl = buildJdbcUrl(config);
+        LOGGER.info("Opening database connection: type={}, endpoint={}", type, displayEndpoint(config));
         final AtomicBoolean abandoned = new AtomicBoolean(false);
         ExecutorService connectionExecutor = Executors.newSingleThreadExecutor(new ConnectionThreadFactory());
         Future<Connection> connectionFuture = connectionExecutor.submit(new Callable<Connection>() {
@@ -64,7 +75,9 @@ public final class DatabaseSupport {
             }
         });
         try {
-            return connectionFuture.get(MigrationConstants.CONNECTION_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            Connection connection = connectionFuture.get(MigrationConstants.CONNECTION_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            LOGGER.info("Database connection established: type={}, endpoint={}", type, displayEndpoint(config));
+            return connection;
         } catch (TimeoutException exception) {
             abandoned.set(true);
             boolean cancelled = connectionFuture.cancel(true);
@@ -75,6 +88,8 @@ public final class DatabaseSupport {
                 + " 秒），请检查地址、端口、网络和数据库监听状态");
         } catch (ExecutionException exception) {
             Throwable cause = exception.getCause();
+            LOGGER.warn("Database connection failed: type={}, endpoint={}, reason={}",
+                type, displayEndpoint(config), SqlSupport.safeMessage(cause));
             if (cause instanceof Exception) {
                 throw (Exception)cause;
             }
@@ -107,6 +122,8 @@ public final class DatabaseSupport {
             result.put("databaseProduct", metaData.getDatabaseProductName());
             result.put("databaseVersion", metaData.getDatabaseProductVersion());
             result.put("costMs", System.currentTimeMillis() - begin);
+            LOGGER.info("Database connection test passed: type={}, product={}, version={}, costMs={}",
+                type, result.get("databaseProduct"), result.get("databaseVersion"), result.get("costMs"));
             return result;
         }
     }
@@ -133,10 +150,14 @@ public final class DatabaseSupport {
             if (MigrationConstants.DB_MYSQL.equals(type) && !lowerUrl.startsWith(MYSQL_URL_PREFIX)) {
                 throw new IllegalArgumentException("MySQL 的 JDBC URL 必须以 jdbc:mysql:// 开头");
             }
-            if (MigrationConstants.DB_MYSQL.equals(type)) {
-                int authorityEnd = lowerUrl.indexOf('/', MYSQL_URL_PREFIX.length());
-                String authority = authorityEnd < 0 ? lowerUrl.substring(MYSQL_URL_PREFIX.length())
-                    : lowerUrl.substring(MYSQL_URL_PREFIX.length(), authorityEnd);
+            if (MigrationConstants.DB_DM.equals(type) && !lowerUrl.startsWith(DM_URL_PREFIX)) {
+                throw new IllegalArgumentException("达梦的 JDBC URL 必须以 jdbc:dm:// 开头");
+            }
+            if (MigrationConstants.DB_MYSQL.equals(type) || MigrationConstants.DB_DM.equals(type)) {
+                String prefix = MigrationConstants.DB_MYSQL.equals(type) ? MYSQL_URL_PREFIX : DM_URL_PREFIX;
+                int authorityEnd = lowerUrl.indexOf('/', prefix.length());
+                String authority = authorityEnd < 0 ? lowerUrl.substring(prefix.length())
+                    : lowerUrl.substring(prefix.length(), authorityEnd);
                 if (authority.indexOf('@') >= 0) {
                     throw new IllegalArgumentException("JDBC URL 中不能包含账号或密码，请使用页面独立字段填写");
                 }
@@ -148,13 +169,19 @@ public final class DatabaseSupport {
         }
 
         requireText(config.getHost(), "数据库地址不能为空");
-        requireText(config.getDatabase(),
-            MigrationConstants.DB_MYSQL.equals(type) ? "数据库名不能为空" : "Oracle 服务名或 SID 不能为空");
+        if (MigrationConstants.DB_DM.equals(type)) {
+            if (!trim(config.getDatabase()).isEmpty()) {
+                SqlSupport.normalizeColumnName(config.getDatabase(), "达梦 Schema");
+            }
+        } else {
+            requireText(config.getDatabase(),
+                MigrationConstants.DB_MYSQL.equals(type) ? "数据库名不能为空" : "Oracle 服务名或 SID 不能为空");
+        }
         if (containsLineBreak(config.getHost()) || containsLineBreak(config.getDatabase())) {
             throw new IllegalArgumentException("数据库地址和库名不能包含换行");
         }
         int port = resolvePort(config);
-        if (port <= 0 || port > 65535) {
+        if (port < MIN_PORT || port > MAX_PORT) {
             throw new IllegalArgumentException("数据库端口必须在 1 到 65535 之间");
         }
     }
@@ -162,8 +189,9 @@ public final class DatabaseSupport {
     public static String normalizeType(String type) {
         String normalized = trim(type).toUpperCase(Locale.ROOT);
         if (!MigrationConstants.DB_MYSQL.equals(normalized)
-            && !MigrationConstants.DB_ORACLE.equals(normalized)) {
-            throw new IllegalArgumentException("数据库类型只支持 MYSQL 或 ORACLE");
+            && !MigrationConstants.DB_ORACLE.equals(normalized)
+            && !MigrationConstants.DB_DM.equals(normalized)) {
+            throw new IllegalArgumentException("数据库类型只支持 MYSQL、ORACLE 或 DM");
         }
         return normalized;
     }
@@ -172,7 +200,11 @@ public final class DatabaseSupport {
         if (config.getPort() != null) {
             return config.getPort();
         }
-        return MigrationConstants.DB_MYSQL.equals(normalizeType(config.getType()))
+        String type = normalizeType(config.getType());
+        if (MigrationConstants.DB_DM.equals(type)) {
+            return MigrationConstants.DEFAULT_DM_PORT;
+        }
+        return MigrationConstants.DB_MYSQL.equals(type)
             ? MigrationConstants.DEFAULT_MYSQL_PORT : MigrationConstants.DEFAULT_ORACLE_PORT;
     }
 
@@ -199,6 +231,11 @@ public final class DatabaseSupport {
                 + "?useUnicode=true&characterEncoding=UTF-8&useSSL=false&serverTimezone=Asia/Shanghai"
                 + "&rewriteBatchedStatements=true&useServerPrepStmts=true&useCursorFetch=true"
                 + "&connectTimeout=" + MigrationConstants.CONNECTION_TIMEOUT_SECONDS * 1000;
+        }
+        if (MigrationConstants.DB_DM.equals(type)) {
+            String schema = database.isEmpty() ? "" : "&schema=" + database.toUpperCase(Locale.ROOT);
+            return DM_URL_PREFIX + host + ":" + port + "?connectTimeout="
+                + MigrationConstants.CONNECTION_TIMEOUT_SECONDS * 1000 + schema;
         }
         String oracleMode = trim(config.getOracleMode()).toUpperCase(Locale.ROOT);
         if (MigrationConstants.ORACLE_SID.equals(oracleMode)) {

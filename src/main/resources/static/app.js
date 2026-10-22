@@ -8,6 +8,13 @@
     var MIN_MIGRATION_STEPS = 1;
     var MIGRATION_STEP_SELECTOR = '#stepsContainer .migration-step';
     var TASK_TYPE_ARCHIVE = 'ARCHIVE';
+    var DB_MYSQL = 'MYSQL';
+    var DB_ORACLE = 'ORACLE';
+    var DATABASE_TYPE_SETTINGS = {
+        MYSQL: {port: '3306', label: '数据库名', placeholder: '例如 business_db', jdbcUrl: 'jdbc:mysql://...'},
+        ORACLE: {port: '1521', label: '服务名 / SID', placeholder: '例如 ORCL', jdbcUrl: 'jdbc:oracle:thin:@...'},
+        DM: {port: '5236', label: '模式名 / Schema（选填）', placeholder: '留空使用登录用户名', jdbcUrl: 'jdbc:dm://主机:5236'}
+    };
 
     var state = {
         tasks: [],
@@ -109,10 +116,12 @@
 
     function updateDatabaseType(prefix) {
         var type = value(prefix + 'Type');
-        var oracle = type === 'ORACLE';
-        document.getElementById(prefix + 'Port').value = oracle ? '1521' : '3306';
-        document.getElementById(prefix + 'DatabaseLabel').textContent = oracle ? '服务名 / SID' : '数据库名';
-        document.getElementById(prefix + 'Database').placeholder = oracle ? '例如 ORCL' : '例如 business_db';
+        var settings = DATABASE_TYPE_SETTINGS[type] || DATABASE_TYPE_SETTINGS[DB_MYSQL];
+        var oracle = type === DB_ORACLE;
+        document.getElementById(prefix + 'Port').value = settings.port;
+        document.getElementById(prefix + 'DatabaseLabel').textContent = settings.label;
+        document.getElementById(prefix + 'Database').placeholder = settings.placeholder;
+        document.getElementById(prefix + 'JdbcUrl').placeholder = settings.jdbcUrl;
         document.getElementById(prefix + 'OracleModeWrap').classList.toggle('hidden', !oracle);
     }
 
@@ -166,7 +175,7 @@
     }
 
     function fillDatabaseConfig(prefix, config) {
-        document.getElementById(prefix + 'Type').value = config.type || 'MYSQL';
+        document.getElementById(prefix + 'Type').value = config.type || DB_MYSQL;
         updateDatabaseType(prefix);
         setValue(prefix + 'Host', config.host);
         if (config.port != null) { setValue(prefix + 'Port', config.port); }

@@ -63,6 +63,7 @@ public class MigrationEngine {
     private static final String SQLSTATE_CONNECTION_PREFIX = "08";
     private static final int MYSQL_TABLE_NOT_FOUND_CODE = 1146;
     private static final int ORACLE_TABLE_NOT_FOUND_CODE = 942;
+    private static final int DM_TABLE_NOT_FOUND_CODE = -2106;
     private static final int MYSQL_MAX_DECIMAL_PRECISION = 65;
     private static final int MYSQL_MAX_DECIMAL_SCALE = 30;
     private static final int ORACLE_MAX_NUMBER_PRECISION = 38;
@@ -361,6 +362,10 @@ public class MigrationEngine {
             && MigrationConstants.INSERT_IGNORE.equals(insertMode)) {
             task.warn("步骤 " + request.getName()
                 + "：目标表没有可用于 MERGE 的完整主键/唯一键，发生 ORA-00001 时将回退逐行跳过重复数据");
+        } else if (MigrationConstants.DB_DM.equals(targetType)
+            && MigrationConstants.INSERT_IGNORE.equals(insertMode)) {
+            task.info("步骤 " + request.getName()
+                + "：达梦使用批量 INSERT，遇到唯一键冲突时先回滚当前批次，再逐行识别并跳过重复数据");
         }
 
         if (cursorIndex >= 0) {
@@ -490,7 +495,7 @@ public class MigrationEngine {
         int sourceGroup = typeGroup(sourceColumn.jdbcType);
         if (sourceGroup == TypeGroup.NUMBER) {
             if (isApproximateNumeric(sourceColumn.jdbcType)) {
-                return MigrationConstants.DB_MYSQL.equals(targetType) ? "DOUBLE" : "BINARY_DOUBLE";
+                return MigrationConstants.DB_ORACLE.equals(targetType) ? "BINARY_DOUBLE" : "DOUBLE";
             }
             if (sourceColumn.jdbcType == Types.BOOLEAN) {
                 return MigrationConstants.DB_MYSQL.equals(targetType) ? "TINYINT(1)" : "NUMBER(1,0)";
@@ -527,7 +532,7 @@ public class MigrationEngine {
                 return longText || sourceColumn.precision > MYSQL_SUGGESTED_VARCHAR_LIMIT
                     ? "LONGTEXT" : "VARCHAR(" + sourceColumn.precision + ")";
             }
-            if (nationalText) {
+            if (nationalText && MigrationConstants.DB_ORACLE.equals(targetType)) {
                 return longText || sourceColumn.precision > ORACLE_MAX_NVARCHAR_LENGTH
                     ? "NCLOB" : "NVARCHAR2(" + sourceColumn.precision + ")";
             }
@@ -543,6 +548,10 @@ public class MigrationEngine {
                     return "TIME(6)";
                 }
                 return "DATETIME(6)";
+            }
+            if (MigrationConstants.DB_DM.equals(targetType)
+                && (sourceColumn.jdbcType == Types.TIME || sourceColumn.jdbcType == JDBC_TIME_WITH_TIMEZONE)) {
+                return "TIME(6)";
             }
             return sourceColumn.jdbcType == Types.DATE ? "DATE" : "TIMESTAMP(6)";
         }
@@ -566,7 +575,8 @@ public class MigrationEngine {
     }
 
     private String scriptIdentifier(String identifier, String targetType) {
-        return MigrationConstants.DB_ORACLE.equals(targetType) ? identifier.toUpperCase(Locale.ROOT) : identifier;
+        return MigrationConstants.DB_ORACLE.equals(targetType) || MigrationConstants.DB_DM.equals(targetType)
+            ? identifier.toUpperCase(Locale.ROOT) : identifier;
     }
 
     private String sanitizeScriptComment(String value) {
@@ -586,6 +596,10 @@ public class MigrationEngine {
                     }
                     if (MigrationConstants.DB_ORACLE.equals(targetType)
                         && sqlException.getErrorCode() == ORACLE_TABLE_NOT_FOUND_CODE) {
+                        return true;
+                    }
+                    if (MigrationConstants.DB_DM.equals(targetType)
+                        && sqlException.getErrorCode() == DM_TABLE_NOT_FOUND_CODE) {
                         return true;
                     }
                     sqlException = sqlException.getNextException();
@@ -1114,6 +1128,7 @@ public class MigrationEngine {
     private BatchResult writeBatch(MigrationTask task, Connection connection, PreparedStep step, List<Object[]> batch,
         String targetType) throws Exception {
         try {
+            enableIdentityInsert(task, connection, step, targetType);
             BatchResult result = executePreparedBatch(task, connection, step.writeSql, step.targetColumns, batch);
             connection.commit();
             result.batchNumberHint = step.nextBatchNumber();
@@ -1121,10 +1136,11 @@ public class MigrationEngine {
         } catch (SQLException exception) {
             rollbackQuietly(connection);
             boolean ignoreMode = MigrationConstants.INSERT_IGNORE.equals(step.insertMode);
-            if (MigrationConstants.DB_ORACLE.equals(targetType) && ignoreMode
+            if ((MigrationConstants.DB_ORACLE.equals(targetType) || MigrationConstants.DB_DM.equals(targetType))
+                && ignoreMode
                 && SqlSupport.isDuplicateKey(exception, targetType)) {
                 task.warn("步骤 " + step.displayName + " 批量写入遇到重复键，回退逐行识别并跳过重复数据");
-                BatchResult result = executeOracleRowsWithDuplicateIgnore(task, connection, step, batch, targetType);
+                BatchResult result = executeRowsWithDuplicateIgnore(task, connection, step, batch, targetType);
                 result.batchNumberHint = step.nextBatchNumber();
                 return result;
             }
@@ -1149,11 +1165,12 @@ public class MigrationEngine {
         }
     }
 
-    private BatchResult executeOracleRowsWithDuplicateIgnore(MigrationTask task, Connection connection,
+    private BatchResult executeRowsWithDuplicateIgnore(MigrationTask task, Connection connection,
         PreparedStep step, List<Object[]> batch, String targetType) throws SQLException, StopRequestedException,
         InterruptedException {
         long inserted = 0L;
         long ignored = 0L;
+        enableIdentityInsert(task, connection, step, targetType);
         try (PreparedStatement statement = connection.prepareStatement(step.strictInsertSql)) {
             task.setCurrentStatement(statement);
             try {
@@ -1181,6 +1198,24 @@ public class MigrationEngine {
             }
         }
         return new BatchResult(inserted, ignored);
+    }
+
+    /**
+     * 复用目标结果元数据判断是否需要保留达梦自增列的源值。
+     * Params: task 当前任务；connection 当前连接；step 当前步骤；targetType 目标库类型。
+     * Returns: 无；无需附加数据库元数据查询。
+     */
+    private void enableIdentityInsert(MigrationTask task, Connection connection, PreparedStep step,
+        String targetType) throws SQLException {
+        if (!MigrationConstants.DB_DM.equals(targetType)) {
+            return;
+        }
+        for (ColumnMeta column : step.targetColumns) {
+            if (column.autoIncrement) {
+                DamengIdentitySupport.enable(task, connection, step.targetName, true);
+                return;
+            }
+        }
     }
 
     private void bindRow(PreparedStatement statement, List<ColumnMeta> targetColumns, Object[] row)
@@ -1334,6 +1369,9 @@ public class MigrationEngine {
             return new MetadataLocation(catalog, null);
         }
         String schema = targetName.getSchema();
+        if (isBlank(schema) && MigrationConstants.DB_DM.equals(targetType)) {
+            schema = connection.getSchema();
+        }
         if (isBlank(schema)) {
             schema = connection.getMetaData().getUserName();
         }

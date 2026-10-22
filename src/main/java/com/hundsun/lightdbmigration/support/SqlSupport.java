@@ -9,6 +9,11 @@ public final class SqlSupport {
     private static final Pattern SAFE_IDENTIFIER = Pattern.compile("[A-Za-z0-9_$#]+");
     private static final String SELECT_PREFIX = "SELECT";
     private static final String WITH_PREFIX = "WITH";
+    private static final int ORACLE_DUPLICATE_KEY_CODE = 1;
+    private static final int MYSQL_DUPLICATE_KEY_CODE = 1062;
+    private static final int DM_DUPLICATE_KEY_CODE = -6602;
+    private static final int DM_NAMED_DUPLICATE_KEY_CODE = -6625;
+    private static final String INTEGRITY_CONSTRAINT_SQL_STATE = "23000";
 
     private SqlSupport() {
     }
@@ -92,12 +97,18 @@ public final class SqlSupport {
     public static boolean isDuplicateKey(SQLException exception, String databaseType) {
         SQLException current = exception;
         while (current != null) {
-            if (MigrationConstants.DB_ORACLE.equals(databaseType) && current.getErrorCode() == 1) {
+            if (MigrationConstants.DB_ORACLE.equals(databaseType)
+                && current.getErrorCode() == ORACLE_DUPLICATE_KEY_CODE) {
+                return true;
+            }
+            if (MigrationConstants.DB_DM.equals(databaseType)
+                && (current.getErrorCode() == DM_DUPLICATE_KEY_CODE
+                || current.getErrorCode() == DM_NAMED_DUPLICATE_KEY_CODE)) {
                 return true;
             }
             String sqlState = current.getSQLState();
-            if (MigrationConstants.DB_MYSQL.equals(databaseType) && "23000".equals(sqlState)
-                && current.getErrorCode() == 1062) {
+            if (MigrationConstants.DB_MYSQL.equals(databaseType) && INTEGRITY_CONSTRAINT_SQL_STATE.equals(sqlState)
+                && current.getErrorCode() == MYSQL_DUPLICATE_KEY_CODE) {
                 return true;
             }
             current = current.getNextException();

@@ -50,6 +50,7 @@
                         <select id="sourceType" class="db-type" data-prefix="source">
                             <option value="MYSQL">MySQL</option>
                             <option value="ORACLE">Oracle</option>
+                            <option value="DM">达梦（DM）</option>
                         </select>
                     </label>
                     <label>主机地址<input id="sourceHost" type="text" placeholder="例如 10.0.0.10" autocomplete="off"></label>
@@ -63,7 +64,7 @@
                 </div>
                 <details class="advanced-config">
                     <summary>高级：直接填写 JDBC URL</summary>
-                    <label>JDBC URL（填写后优先使用）<input id="sourceJdbcUrl" type="text" placeholder="jdbc:mysql://... 或 jdbc:oracle:thin:@..." autocomplete="off"></label>
+                    <label>JDBC URL（填写后优先使用）<input id="sourceJdbcUrl" type="text" placeholder="jdbc:mysql://..." autocomplete="off"></label>
                 </details>
                 <div id="sourceTestResult" class="test-result"></div>
             </article>
@@ -80,6 +81,7 @@
                         <select id="targetType" class="db-type" data-prefix="target">
                             <option value="MYSQL">MySQL</option>
                             <option value="ORACLE">Oracle</option>
+                            <option value="DM">达梦（DM）</option>
                         </select>
                     </label>
                     <label>主机地址<input id="targetHost" type="text" placeholder="例如 10.0.0.20" autocomplete="off"></label>
@@ -93,7 +95,7 @@
                 </div>
                 <details class="advanced-config">
                     <summary>高级：直接填写 JDBC URL</summary>
-                    <label>JDBC URL（填写后优先使用）<input id="targetJdbcUrl" type="text" placeholder="jdbc:mysql://... 或 jdbc:oracle:thin:@..." autocomplete="off"></label>
+                    <label>JDBC URL（填写后优先使用）<input id="targetJdbcUrl" type="text" placeholder="jdbc:mysql://..." autocomplete="off"></label>
                 </details>
                 <div id="targetTestResult" class="test-result"></div>
             </article>

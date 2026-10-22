@@ -4,6 +4,7 @@ public final class MigrationConstants {
 
     public static final String DB_MYSQL = "MYSQL";
     public static final String DB_ORACLE = "ORACLE";
+    public static final String DB_DM = "DM";
     public static final String ORACLE_SERVICE = "SERVICE";
     public static final String ORACLE_SID = "SID";
     public static final String INSERT_IGNORE = "IGNORE_DUPLICATE";
@@ -15,6 +16,7 @@ public final class MigrationConstants {
     public static final String ARCHIVE_CHILD_NODE_PREFIX = "CHILD_";
     public static final int DEFAULT_MYSQL_PORT = 3306;
     public static final int DEFAULT_ORACLE_PORT = 1521;
+    public static final int DEFAULT_DM_PORT = 5236;
     public static final int DEFAULT_BATCH_SIZE = 1000;
     public static final int MIN_BATCH_SIZE = 1;
     public static final int MAX_BATCH_SIZE = 10000;

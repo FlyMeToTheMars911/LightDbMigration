@@ -162,7 +162,7 @@ public class ArchiveEngine {
         validateUniqueColumnNames(targetTableColumns, request.getName() + "归档表");
         validateUniqueColumnNames(queryColumns, request.getName() + "归档查询");
         validateSameStructure(sourceTableColumns, targetTableColumns, request.getName());
-        validateQueryCoversSourceTable(queryColumns, sourceTableColumns, request.getName());
+        validateQueryCoversSourceTable(queryColumns, sourceTableColumns, request.getName(), databaseType);
         boolean keysetPagination = request.getCursorColumn() != null
             && !request.getCursorColumn().trim().isEmpty();
         List<String> keyColumnNames = resolveArchiveKeyColumns(task, connection, request, sourceName,
@@ -179,8 +179,10 @@ public class ArchiveEngine {
         long totalRows = countAndValidateArchiveKeys(task, connection, sourceSql, keyColumns,
             databaseType, request.getName(), keyLabel, keysetPagination);
         String insertSql = buildInsertSql(targetName, queryColumns, databaseType);
+        boolean dmIdentityInsert = MigrationConstants.DB_DM.equals(databaseType)
+            && hasAutoIncrement(targetTableColumns);
         return new PreparedArchiveTable(index, request, sourceName, targetName, sourceIdentity, targetIdentity,
-            sourceSql, queryColumns, keyIndexes, keyColumns, keysetPagination, insertSql, totalRows);
+            sourceSql, queryColumns, keyIndexes, keyColumns, keysetPagination, insertSql, totalRows, dmIdentityInsert);
     }
 
     private void archiveAllMainTables(MigrationTask task, Connection connection, PreparedArchive prepared,
@@ -419,6 +421,7 @@ public class ArchiveEngine {
 
     private long insertRows(MigrationTask task, Connection connection, PreparedArchiveTable table,
         List<Object[]> rows) throws Exception {
+        DamengIdentitySupport.enable(task, connection, table.targetName, table.dmIdentityInsert);
         logBatchSql(task, "归档写入 " + table.displayName, table.insertSql, rows);
         try (PreparedStatement statement = connection.prepareStatement(table.insertSql)) {
             task.setCurrentStatement(statement);
@@ -551,6 +554,9 @@ public class ArchiveEngine {
     private List<ColumnMeta> readTableColumns(MigrationTask task, Connection connection, QualifiedName tableName,
         String databaseType) throws Exception {
         String sql = "SELECT * FROM " + quoteQualifiedName(tableName, databaseType) + " WHERE 1 = 0";
+        if (MigrationConstants.DB_DM.equals(databaseType)) {
+            return readColumnsForSql(task, connection, sql, true);
+        }
         return readQueryColumns(task, connection, sql);
     }
 
@@ -592,7 +598,13 @@ public class ArchiveEngine {
         if (MigrationConstants.DB_MYSQL.equals(databaseType)) {
             catalog = tableName.getSchema() == null ? connection.getCatalog() : tableName.getSchema();
         } else {
-            schema = tableName.getSchema() == null ? metadata.getUserName() : tableName.getSchema();
+            schema = tableName.getSchema();
+            if (schema == null && MigrationConstants.DB_DM.equals(databaseType)) {
+                schema = connection.getSchema();
+            }
+            if (schema == null || schema.trim().isEmpty()) {
+                schema = metadata.getUserName();
+            }
         }
         String metadataTable = configuredIdentifier(tableName.getTable(), databaseType);
         String metadataSchema = schema == null ? null : configuredIdentifier(schema, databaseType);
@@ -611,11 +623,22 @@ public class ArchiveEngine {
     private List<ColumnMeta> readQueryColumns(MigrationTask task, Connection connection, String sourceSql)
         throws Exception {
         String sql = "SELECT * FROM (" + sourceSql + ") LM_ARCHIVE_META WHERE 1 = 0";
+        return readColumnsForSql(task, connection, sql, false);
+    }
+
+    /**
+     * 执行既有零行元数据查询；达梦物理表直接查询，保留驱动返回的自增标志。
+     * Params: task 当前任务；connection 当前连接；sql 零行字段查询；readIdentity 是否读取物理表自增标志。
+     * Returns: 查询字段元数据。
+     */
+    private List<ColumnMeta> readColumnsForSql(MigrationTask task, Connection connection, String sql,
+        boolean readIdentity)
+        throws Exception {
         logSql(task, "字段元数据校验", sql, java.util.Collections.<Object>emptyList());
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             task.setCurrentStatement(statement);
             try (ResultSet resultSet = statement.executeQuery()) {
-                return readColumnMetadata(resultSet.getMetaData());
+                return readColumnMetadata(resultSet.getMetaData(), readIdentity);
             } finally {
                 task.clearCurrentStatement(statement);
             }
@@ -623,6 +646,14 @@ public class ArchiveEngine {
     }
 
     private List<ColumnMeta> readColumnMetadata(ResultSetMetaData metadata) throws SQLException {
+        return readColumnMetadata(metadata, false);
+    }
+
+    /**
+     * Params: metadata 当前查询结果元数据；readIdentity 仅达梦物理表查询需要读取自增标志。
+     * Returns: 字段元数据；其他数据库和派生查询保留原有读取行为。
+     */
+    private List<ColumnMeta> readColumnMetadata(ResultSetMetaData metadata, boolean readIdentity) throws SQLException {
         List<ColumnMeta> result = new ArrayList<>();
         for (int i = 1; i <= metadata.getColumnCount(); i++) {
             String name = metadata.getColumnLabel(i);
@@ -630,9 +661,24 @@ public class ArchiveEngine {
                 name = metadata.getColumnName(i);
             }
             result.add(new ColumnMeta(name, metadata.getColumnType(i), metadata.getColumnTypeName(i),
-                metadata.getPrecision(i), metadata.getScale(i), metadata.isNullable(i)));
+                metadata.getPrecision(i), metadata.getScale(i), metadata.isNullable(i),
+                readIdentity && metadata.isAutoIncrement(i)));
         }
         return result;
+    }
+
+    /**
+     * 使用已读取的目标表字段元数据检查自增列，不改变归档游标选择。
+     * Params: columns 目标表字段。
+     * Returns: 是否存在需要显式保留源值的自增列。
+     */
+    private boolean hasAutoIncrement(List<ColumnMeta> columns) {
+        for (ColumnMeta column : columns) {
+            if (column.autoIncrement) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void validateUniqueColumnNames(List<ColumnMeta> columns, String label) {
@@ -665,6 +711,16 @@ public class ArchiveEngine {
 
     private void validateQueryCoversSourceTable(List<ColumnMeta> queryColumns, List<ColumnMeta> sourceColumns,
         String displayName) {
+        validateQueryCoversSourceTable(queryColumns, sourceColumns, displayName, null);
+    }
+
+    /**
+     * 校验归档查询覆盖源表字段；达梦派生查询可能将物理非空列报告为可空。
+     * Params: queryColumns 查询字段；sourceColumns 物理源表字段；displayName 节点名；databaseType 数据库类型。
+     * Returns: 无；类型、精度或字段集合不一致时拒绝归档，物理表同构仍单独严格校验。
+     */
+    private void validateQueryCoversSourceTable(List<ColumnMeta> queryColumns, List<ColumnMeta> sourceColumns,
+        String displayName, String databaseType) {
         if (queryColumns.size() != sourceColumns.size()) {
             throw new IllegalArgumentException(displayName + "归档查询必须返回源表全部字段，不允许只归档部分字段");
         }
@@ -675,18 +731,28 @@ public class ArchiveEngine {
                 throw new IllegalArgumentException(displayName + "归档查询返回了非源表字段或字段别名："
                     + queryColumn.name);
             }
-            if (!sameColumnDefinition(queryColumn, sourceColumn)) {
-                throw new IllegalArgumentException(displayName + "归档查询字段类型与源表不同：" + queryColumn.name);
+            boolean sameDefinition = MigrationConstants.DB_DM.equals(databaseType)
+                ? sameColumnTypeDefinition(queryColumn, sourceColumn) : sameColumnDefinition(queryColumn, sourceColumn);
+            if (!sameDefinition) {
+                throw new IllegalArgumentException(displayName + "归档查询字段类型与源表不同：" + queryColumn.name
+                    + "，归档查询=" + queryColumn.describe() + "，源表=" + sourceColumn.describe());
             }
         }
     }
 
     private boolean sameColumnDefinition(ColumnMeta left, ColumnMeta right) {
+        return sameColumnTypeDefinition(left, right) && left.nullable == right.nullable;
+    }
+
+    /**
+     * Params: left/right 待比较字段。
+     * Returns: JDBC类型、数据库类型名、精度和小数位是否完全一致。
+     */
+    private boolean sameColumnTypeDefinition(ColumnMeta left, ColumnMeta right) {
         return left.jdbcType == right.jdbcType
             && normalizeName(left.typeName).equals(normalizeName(right.typeName))
             && left.precision == right.precision
-            && left.scale == right.scale
-            && left.nullable == right.nullable;
+            && left.scale == right.scale;
     }
 
     private long countAndValidateArchiveKeys(MigrationTask task, Connection connection, String sourceSql,
@@ -803,7 +869,8 @@ public class ArchiveEngine {
     }
 
     private String configuredIdentifier(String identifier, String databaseType) {
-        return MigrationConstants.DB_ORACLE.equals(databaseType) ? identifier.toUpperCase(Locale.ROOT) : identifier;
+        return MigrationConstants.DB_ORACLE.equals(databaseType) || MigrationConstants.DB_DM.equals(databaseType)
+            ? identifier.toUpperCase(Locale.ROOT) : identifier;
     }
 
     private String canonicalTableIdentity(Connection connection, QualifiedName name, String databaseType)
@@ -1099,12 +1166,27 @@ public class ArchiveEngine {
         private final boolean keysetPagination;
         private final String insertSql;
         private final long totalRows;
+        private final boolean dmIdentityInsert;
         private int[] parentRelationIndexes = new int[0];
 
         private PreparedArchiveTable(int index, ArchiveTableRequest request, QualifiedName sourceName,
             QualifiedName targetName, String sourceIdentity, String targetIdentity, String sourceSql,
             List<ColumnMeta> columns, List<Integer> keyIndexes, List<ColumnMeta> keyColumns,
             boolean keysetPagination, String insertSql, long totalRows) {
+            this(index, request, sourceName, targetName, sourceIdentity, targetIdentity, sourceSql,
+                columns, keyIndexes, keyColumns, keysetPagination, insertSql, totalRows, false);
+        }
+
+        /**
+         * Params: index/request 节点配置；sourceName/targetName 源目标表；sourceIdentity/targetIdentity 物理表标识；
+         * sourceSql 查询；columns 字段；keyIndexes/keyColumns 删除键；keysetPagination 分页模式；
+         * insertSql 写入SQL；totalRows 预计行数；dmIdentityInsert 是否需要显式保留达梦自增列。
+         * Returns: 归档执行节点。
+         */
+        private PreparedArchiveTable(int index, ArchiveTableRequest request, QualifiedName sourceName,
+            QualifiedName targetName, String sourceIdentity, String targetIdentity, String sourceSql,
+            List<ColumnMeta> columns, List<Integer> keyIndexes, List<ColumnMeta> keyColumns,
+            boolean keysetPagination, String insertSql, long totalRows, boolean dmIdentityInsert) {
             this.index = index;
             this.request = request;
             this.displayName = request.getName();
@@ -1119,6 +1201,7 @@ public class ArchiveEngine {
             this.keysetPagination = keysetPagination;
             this.insertSql = insertSql;
             this.totalRows = totalRows;
+            this.dmIdentityInsert = dmIdentityInsert;
         }
 
         private ColumnMeta keyColumn() {
@@ -1137,18 +1220,30 @@ public class ArchiveEngine {
         private final int precision;
         private final int scale;
         private final int nullable;
+        private final boolean autoIncrement;
 
         private ColumnMeta(String name, int jdbcType, String typeName, int precision, int scale, int nullable) {
+            this(name, jdbcType, typeName, precision, scale, nullable, false);
+        }
+
+        /**
+         * Params: name 字段名；jdbcType/typeName 字段类型；precision/scale 精度；nullable 可空标志；
+         * autoIncrement 结果元数据的自增标志。
+         * Returns: 字段元数据。
+         */
+        private ColumnMeta(String name, int jdbcType, String typeName, int precision, int scale, int nullable,
+            boolean autoIncrement) {
             this.name = name;
             this.jdbcType = jdbcType;
             this.typeName = typeName;
             this.precision = precision;
             this.scale = scale;
             this.nullable = nullable;
+            this.autoIncrement = autoIncrement;
         }
 
         private String describe() {
-            return typeName + "(" + precision + "," + scale + "),nullable=" + nullable;
+            return typeName + "(" + precision + "," + scale + "),jdbcType=" + jdbcType + ",nullable=" + nullable;
         }
     }
 

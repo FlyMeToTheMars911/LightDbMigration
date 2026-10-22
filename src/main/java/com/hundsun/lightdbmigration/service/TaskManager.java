@@ -173,7 +173,8 @@ public class TaskManager implements DisposableBean {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("name", "Light DB Migration");
         result.put("version", "1.2.0");
-        result.put("supportedDatabases", new String[] {MigrationConstants.DB_MYSQL, MigrationConstants.DB_ORACLE});
+        result.put("supportedDatabases", new String[] {MigrationConstants.DB_MYSQL, MigrationConstants.DB_ORACLE,
+            MigrationConstants.DB_DM});
         result.put("maxConcurrentTasks", MigrationConstants.EXECUTOR_SIZE);
         result.put("taskDataStorage", "MEMORY_ONLY");
         result.put("lastDatabaseConfigStorage", "LOCAL_AES_GCM");

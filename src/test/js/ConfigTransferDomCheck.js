@@ -40,7 +40,7 @@ function waitFor(predicate, message) {
     });
 }
 
-async function createBrowser() {
+async function createBrowser(lastDatabaseConfig) {
     const browserErrors = [];
     const consoleMessages = [];
     const virtualConsole = new VirtualConsole();
@@ -61,7 +61,7 @@ async function createBrowser() {
         requests.push({url: url, method: method});
         let data;
         if (method === 'GET' && url === '/api/system') { data = {version: 'dom-check'}; }
-        else if (method === 'GET' && url === '/api/config/last') { data = null; }
+        else if (method === 'GET' && url === '/api/config/last') { data = lastDatabaseConfig || null; }
         else if (method === 'GET' && url === '/api/tasks') { data = []; }
         else { throw new Error('Unexpected network request in configuration transfer: ' + method + ' ' + url); }
         return {ok: true, status: 200, json: async function () { return {success: true, data: data}; }};
@@ -106,10 +106,45 @@ function databaseSnapshot(browser) {
     return result;
 }
 
+function verifyDatabaseTypes(browser, rememberedConfig) {
+    ['source', 'target'].forEach(function (prefix) {
+        const config = rememberedConfig[prefix];
+        const rememberedPort = config.port == null ? '5236' : String(config.port);
+        assert.strictEqual(browser.document.getElementById(prefix + 'Type').value, 'DM',
+            'Saved Dameng database type was not restored');
+        assert.strictEqual(browser.document.getElementById(prefix + 'Port').value, rememberedPort,
+            'Saved Dameng port or its default was not restored');
+        assert.strictEqual(browser.document.getElementById(prefix + 'Database').value, config.database,
+            'Saved Dameng schema was not restored');
+        assert.strictEqual(browser.document.getElementById(prefix + 'Username').value, config.username,
+            'Saved Dameng username was not restored');
+        assert.strictEqual(browser.document.getElementById(prefix + 'Password').value, config.password,
+            'Saved Dameng password was not restored');
+        const select = browser.document.getElementById(prefix + 'Type');
+        [
+            {type: 'ORACLE', port: '1521', label: '服务名 / SID', oracleHidden: false, jdbcPrefix: 'jdbc:oracle:'},
+            {type: 'MYSQL', port: '3306', label: '数据库名', oracleHidden: true, jdbcPrefix: 'jdbc:mysql:'},
+            {type: 'DM', port: '5236', label: '模式名 / Schema（选填）', oracleHidden: true, jdbcPrefix: 'jdbc:dm:'}
+        ].forEach(function (expected) {
+            select.value = expected.type;
+            select.dispatchEvent(new browser.window.Event('change', {bubbles: true}));
+            assert.strictEqual(select.value, expected.type, 'Database type is missing from the selector');
+            assert.strictEqual(browser.document.getElementById(prefix + 'Port').value, expected.port);
+            assert.strictEqual(browser.document.getElementById(prefix + 'DatabaseLabel').textContent, expected.label);
+            assert.strictEqual(browser.document.getElementById(prefix + 'OracleModeWrap').classList.contains('hidden'),
+                expected.oracleHidden, 'Oracle connection mode visibility is incorrect');
+            assert(browser.document.getElementById(prefix + 'JdbcUrl').placeholder.startsWith(expected.jdbcPrefix),
+                'JDBC URL help does not match the selected database type');
+        });
+        assert.strictEqual(browser.document.getElementById(prefix + 'Database').placeholder, '留空使用登录用户名');
+    });
+    console.log('DAMENG_DATABASE_TYPE_AND_REMEMBERED_CONFIG_UI_PASSED');
+}
+
 function fillDatabases(browser) {
     ['source', 'target'].forEach(function (prefix, index) {
-        const values = [index === 0 ? 'ORACLE' : 'MYSQL', prefix + '-retained-host',
-            index === 0 ? '15212' : '13306', prefix + '_retained_db', index === 0 ? 'SID' : 'SERVICE',
+        const values = [index === 0 ? 'DM' : 'MYSQL', prefix + '-retained-host',
+            index === 0 ? '15236' : '13306', prefix + '_retained_db', 'SERVICE',
             prefix + '-retained-user', prefix + '-retained-secret', 'jdbc:retained:' + prefix];
         const type = setValue(browser, '#' + prefix + 'Type', values[0]);
         type.dispatchEvent(new browser.window.Event('change', {bubbles: true}));
@@ -405,9 +440,16 @@ async function verifyInvalidFiles(browser) {
 }
 
 async function main() {
-    const browser = await createBrowser();
+    const rememberedConfig = {
+        source: {type: 'DM', host: 'saved-source-host', port: 15236, database: '',
+            username: 'SOURCE_SCHEMA', password: 'source-retained-secret', jdbcUrl: ''},
+        target: {type: 'DM', host: 'saved-target-host', port: null, database: 'TARGET_SCHEMA',
+            username: 'TARGET_USER', password: 'target-retained-secret', jdbcUrl: ''}
+    };
+    const browser = await createBrowser(rememberedConfig);
     try {
         const initialRequests = browser.requests.slice();
+        verifyDatabaseTypes(browser, rememberedConfig);
         const retainedDatabases = fillDatabases(browser);
         await verifyMigration(browser, retainedDatabases);
         await verifyArchive(browser, retainedDatabases);
