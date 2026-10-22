@@ -4,7 +4,7 @@
 
 ## 主要能力
 
-- JDK 8 单 Jar 服务，无需安装前端运行环境。
+- JDK 8 单 Jar 服务，现场交付包自带 Java 运行环境，无需安装 JDK 或前端运行环境。
 - 支持 MySQL、Oracle、达梦（DM）作为迁移源库或目标库，不使用存储过程。
 - 支持同库数据归档：一个任务可配置多张主业务表，将各自主表选定数据写入同结构归档表，并在批次成功后删除对应源记录。
 - 支持多级关联从表；每张从表可选择任一主表或另一张从表作为上级，并配置“本表字段=上级表字段”，形成多根、单上级、可分支的有向无环关系。
@@ -30,17 +30,24 @@ mvn clean package -DskipTests
 生成文件：
 
 - `target/light-db-migration.jar`：可执行服务。
-- `target/light-db-migration-<项目版本>.zip`：完整现场交付包，包含 Jar、README、Windows/Linux 启动脚本及完整 `docs` 文档目录。
+- `target/light-db-migration-<项目版本>.zip`：完整现场交付包，包含 Jar、`runtime/` Java 运行环境、README、Windows/Linux 启动脚本及完整 `docs` 文档目录。
 
-不需要再手工复制文件或二次压缩。
+默认将构建所用 Java 的安装目录打入 `runtime/`；JDK 8 自动使用其 JDK 根目录，保留运行库及原有许可证文件。不需要再手工复制文件或二次压缩。也可指定待交付的 64 位 JDK/JRE 8 目录：
 
-现场人员不需要 Maven，只需 64 位 JDK 8、发布 Jar 和启动脚本。完整说明见 [现场实施操作手册](docs/现场实施操作手册.md)，本次真实数据库验证见 [现场实测报告](docs/现场实测报告.md)，架构和核心实现见 [开发人员设计说明](docs/开发人员设计说明.md)。
+```text
+mvn clean package -DskipTests "-Dbundled.java.home=D:\delivery\jdk8"
+```
+
+运行环境必须与现场操作系统、CPU 架构匹配：默认包与构建所用 Java 平台一致，Windows 和 Linux 应分别打包；跨平台打包时用 `bundled.java.home` 指向目标平台已解压的 Java 目录。装配前会检查该目录是否包含 `bin/java.exe` 或 `bin/java`。
+
+现场解压匹配平台的完整 ZIP 后直接运行启动脚本，不需要安装 Java、Maven、Node.js 或数据库客户端，也不需要配置 `JAVA_HOME`、`PATH`，启动时不会联网下载依赖。业务操作仍须具备数据库网络连通、账号权限及手册要求的备份等条件。完整说明见 [现场实施操作手册](docs/现场实施操作手册.md)，真实数据库验证见 [现场实测报告](docs/现场实测报告.md)，架构和核心实现见 [开发人员设计说明](docs/开发人员设计说明.md)。
 
 达梦选择数据库类型 `DM`，默认端口 `5236`；Schema 可选，留空使用登录用户默认模式，填写时按普通标识符转为大写。高级连接可填写 `jdbc:dm://主机:端口?schema=模式名`，账号密码使用独立字段。驱动 `DmJdbcDriver18 8.1.3.140` 随依赖打包；达梦验证范围和完整 SQL 见 [达梦适配实测报告](docs/达梦适配实测报告.md)。
 
 ## 启动地址
 
 - Windows：`start.bat 18088`；Linux：`./start.sh 18088`。端口参数省略时默认使用 `8088`。
+- 启动脚本优先使用同目录 `runtime/`；目录缺失时仅为源码开发运行回退系统 Java，目录存在但不完整时直接报错，请重新解压完整交付包。
 - 页面：`http://127.0.0.1:<启动端口>`
 - 应用日志：`logs/light-db-migration.log`
 - 加密配置：`data/last-database-config.dat`，密钥为同目录 `last-config.key`；`data/` 不进入 Git。

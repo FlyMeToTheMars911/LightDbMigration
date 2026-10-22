@@ -20,6 +20,7 @@
     <properties>
         <java.version>8</java.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <bundled.java.home>${java.home}</bundled.java.home>
     </properties>
 
     <dependencies>
@@ -63,6 +64,35 @@
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <version>3.2.0</version>
+                <executions>
+                    <execution>
+                        <id>validate-bundled-runtime</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
+                        <configuration>
+                            <target>
+                                <echo message="Bundling Java from ${bundled.java.home}"/>
+                                <fail message="Invalid bundled.java.home: ${bundled.java.home}. Specify a complete target-platform JDK/JRE containing bin/java or bin/java.exe.">
+                                    <condition>
+                                        <not>
+                                            <or>
+                                                <available file="${bundled.java.home}/bin/java" type="file"/>
+                                                <available file="${bundled.java.home}/bin/java.exe" type="file"/>
+                                            </or>
+                                        </not>
+                                    </condition>
+                                </fail>
+                            </target>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-assembly-plugin</artifactId>
                 <version>3.8.0</version>
                 <configuration>
@@ -84,4 +114,16 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <profile>
+            <id>bundle-jdk8-home</id>
+            <activation>
+                <jdk>[1.8,1.9)</jdk>
+            </activation>
+            <properties>
+                <bundled.java.home>${java.home}/..</bundled.java.home>
+            </properties>
+        </profile>
+    </profiles>
 </project>

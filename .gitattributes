@@ -1,0 +1,3 @@
+# Windows command scripts must retain CRLF even in checkouts on other platforms.
+*.bat text eol=crlf
+*.sh text eol=lf
