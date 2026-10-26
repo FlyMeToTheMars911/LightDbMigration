@@ -8,6 +8,7 @@ import com.hundsun.lightdbmigration.model.TaskLog;
 import com.hundsun.lightdbmigration.model.TaskStatus;
 import com.hundsun.lightdbmigration.support.DatabaseSupport;
 import com.hundsun.lightdbmigration.support.MigrationConstants;
+import com.hundsun.lightdbmigration.support.StructureSyncScript;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,6 +33,10 @@ public class MigrationTask {
     private static final String LOG_INFO = "INFO";
     private static final String LOG_WARN = "WARN";
     private static final String LOG_ERROR = "ERROR";
+    private static final String STRUCTURE_READY = "READY";
+    private static final String STRUCTURE_RUNNING = "RUNNING";
+    private static final String STRUCTURE_SUCCEEDED = "SUCCEEDED";
+    private static final String STRUCTURE_FAILED = "FAILED";
 
     private final String id;
     private final CreateTaskRequest request;
@@ -52,6 +57,18 @@ public class MigrationTask {
     private volatile boolean pauseRequested;
     private volatile boolean stopRequested;
     private volatile String structureSyncScript;
+    /** 当前结构建议内容的摘要，用于防止执行与页面展示不一致的脚本。 */
+    private volatile String structureSyncDigest = "";
+    /** 结构建议执行独立于原迁移或归档任务结果。 */
+    private String structureSyncStatus = STRUCTURE_READY;
+    /** 建议中的可执行语句数量。 */
+    private int structureSyncTotal;
+    /** 已返回执行成功的语句数量。 */
+    private int structureSyncExecuted;
+    /** 结构建议的执行或不可执行原因。 */
+    private String structureSyncMessage;
+    /** 防止任务删除与结构执行请求交错后操作已移除的任务。 */
+    private boolean removedFromManager;
 
     public MigrationTask(String id, CreateTaskRequest request) {
         this.id = id;
@@ -242,8 +259,91 @@ public class MigrationTask {
         stepProgressList.get(stepIndex).setStatus(stepStatus);
     }
 
-    public void setStructureSyncScript(String structureSyncScript) {
+    /** Params: structureSyncScript 本次完整建议。 Returns: 无；只登记内容，不执行数据库操作。 */
+    public synchronized void setStructureSyncScript(String structureSyncScript) {
+        if (STRUCTURE_RUNNING.equals(structureSyncStatus)) {
+            throw new IllegalStateException("结构同步执行中，不能替换建议脚本");
+        }
         this.structureSyncScript = structureSyncScript;
+        structureSyncDigest = StructureSyncScript.digest(structureSyncScript);
+        structureSyncStatus = STRUCTURE_READY;
+        structureSyncExecuted = 0;
+        try {
+            structureSyncTotal = StructureSyncScript.parseStatements(structureSyncScript).size();
+            structureSyncMessage = structureSyncTotal > 0 ? "等待审核并确认执行" : "当前建议只有说明，没有可执行 DDL";
+        } catch (IllegalArgumentException exception) {
+            structureSyncTotal = 0;
+            structureSyncMessage = exception.getMessage();
+        }
+    }
+
+    /** Params: 无。 Returns: 当前服务端建议脚本。 */
+    public String getStructureSyncScript() {
+        return structureSyncScript;
+    }
+
+    /** Params: 无。 Returns: 当前建议摘要。 */
+    public String getStructureSyncDigest() {
+        return structureSyncDigest;
+    }
+
+    /** Params: 无。 Returns: 是否正在执行结构建议。 */
+    public synchronized boolean isStructureSyncRunning() {
+        return STRUCTURE_RUNNING.equals(structureSyncStatus);
+    }
+
+    /**
+     * 原子占用当前脚本的唯一执行机会，不能在原任务运行时执行，也不能重复提交。
+     * Params: digest 页面确认的脚本摘要；total 通过校验的可执行语句数量。
+     * Returns: 无；状态或脚本不匹配时拒绝。
+     */
+    synchronized void beginStructureSync(String digest, int total) {
+        if (removedFromManager) {
+            throw new IllegalStateException("任务已清除，不能执行其结构建议");
+        }
+        if (status != TaskStatus.FAILED) {
+            throw new IllegalStateException("只有结构校验失败的任务可以执行结构建议");
+        }
+        if (!STRUCTURE_READY.equals(structureSyncStatus)) {
+            throw new IllegalStateException("该任务的结构建议已执行或正在执行，请查看日志并重新检查结构");
+        }
+        if (!structureSyncDigest.equals(digest) || total <= 0) {
+            throw new IllegalArgumentException("结构建议已变化或没有可执行 DDL，请刷新任务日志后重新确认");
+        }
+        structureSyncStatus = STRUCTURE_RUNNING;
+        structureSyncTotal = total;
+        structureSyncExecuted = 0;
+        structureSyncMessage = "正在连接该任务目标库并执行已确认的结构建议";
+    }
+
+    /** Params: 无。 Returns: 无；登记一条 DDL 已返回成功。 */
+    synchronized void structureSyncStatementSucceeded() {
+        structureSyncExecuted++;
+        structureSyncMessage = "已执行 " + structureSyncExecuted + "/" + structureSyncTotal + " 条结构建议";
+    }
+
+    /** Params: successful 本轮是否全部成功；message 结果说明。 Returns: 无。 */
+    synchronized void finishStructureSync(boolean successful, String message) {
+        structureSyncStatus = successful ? STRUCTURE_SUCCEEDED : STRUCTURE_FAILED;
+        structureSyncMessage = message;
+    }
+
+    /** Params: 无。 Returns: 不包含 SQL 或凭据的结构建议执行快照。 */
+    public synchronized Map<String, Object> structureSyncExecutionSnapshot() {
+        Map<String, Object> execution = new LinkedHashMap<>();
+        execution.put("status", structureSyncStatus);
+        execution.put("totalStatements", structureSyncTotal);
+        execution.put("executedStatements", structureSyncExecuted);
+        execution.put("message", structureSyncMessage);
+        return execution;
+    }
+
+    /** Params: 无。 Returns: 无；删除与结构执行占用使用同一任务锁。 */
+    synchronized void markRemovedFromManager() {
+        if (isStructureSyncRunning()) {
+            throw new IllegalStateException("结构同步正在执行，暂时不能清除该任务");
+        }
+        removedFromManager = true;
     }
 
     public synchronized void addBatch(int stepIndex, long processed, long inserted, long ignored) {
@@ -317,6 +417,8 @@ public class MigrationTask {
         result.put("steps", stepSnapshots);
         if (includeLogs) {
             result.put("structureSyncScript", structureSyncScript);
+            result.put("structureSyncDigest", structureSyncDigest);
+            result.put("structureSyncExecution", structureSyncExecutionSnapshot());
             List<Map<String, Object>> logSnapshots = new ArrayList<>();
             for (TaskLog taskLog : logs) {
                 if (taskLog.getSequence() > afterSequence) {

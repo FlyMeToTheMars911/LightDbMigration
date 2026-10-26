@@ -113,7 +113,7 @@ public class ArchiveStructureValidationCheck {
             "ALTER TABLE", "CREATE TABLE", "ADD", "MODIFY", MISSING_COLUMN, EXTRA_COLUMN)) {
             assertContains(script, expected, "汇总建议脚本遗漏 " + expected);
         }
-        assertContains(script, "工具不会自动执行", "脚本缺少仅供建议的说明");
+        assertContains(script, "工具不会未经确认执行", "脚本缺少确认要求");
         for (String line : script.split("\\r?\\n")) {
             String statement = line.trim().toUpperCase(Locale.ROOT);
             assertTrue(statement.startsWith("--") || !statement.matches(".*\\bDROP\\b.*"),

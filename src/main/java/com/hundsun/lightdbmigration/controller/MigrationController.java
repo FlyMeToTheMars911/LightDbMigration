@@ -3,6 +3,7 @@ package com.hundsun.lightdbmigration.controller;
 import com.hundsun.lightdbmigration.model.ConnectionTestRequest;
 import com.hundsun.lightdbmigration.model.CreateTaskRequest;
 import com.hundsun.lightdbmigration.model.LastDatabaseConfig;
+import com.hundsun.lightdbmigration.model.StructureSyncRequest;
 import com.hundsun.lightdbmigration.service.TaskManager;
 import com.hundsun.lightdbmigration.support.DatabaseSupport;
 
@@ -84,6 +85,13 @@ public class MigrationController {
     @PostMapping("/tasks/{id}/start")
     public Map<String, Object> startTask(@PathVariable("id") String id) {
         return success(taskManager.start(id));
+    }
+
+    /** Params: id 原任务标识；request 用户确认的建议摘要和临时连接。 Returns: 任务详情及执行进度。 */
+    @PostMapping("/tasks/{id}/structure-sync/execute")
+    public Map<String, Object> executeStructureSync(@PathVariable("id") String id,
+        @RequestBody StructureSyncRequest request) {
+        return success(taskManager.executeStructureSync(id, request));
     }
 
     @PostMapping("/tasks/{id}/pause")

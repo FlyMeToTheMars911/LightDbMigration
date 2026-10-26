@@ -214,7 +214,7 @@ public class MigrationEngine {
         if (!validationIssues.isEmpty()) {
             task.setStructureSyncScript(buildStructureSyncScript(targetType, validationIssues,
                 synchronizationStatements));
-            task.info("已生成目标表结构同步建议脚本，请在任务日志下方审核、复制或下载；工具不会自动执行");
+            task.info("已生成目标表结构同步建议脚本，可在任务日志下方审核、复制、下载或点击执行；工具不会未经确认执行");
             task.error("表结构校验未通过，共发现 " + validationIssues.size() + " 个问题：");
             int issueNumber = 1;
             for (String validationIssue : validationIssues) {
@@ -451,7 +451,8 @@ public class MigrationEngine {
         StringBuilder script = new StringBuilder();
         script.append("-- Light DB Migration 表结构同步建议脚本").append(SCRIPT_LINE_BREAK)
             .append("-- 目标数据库类型：").append(targetType).append(SCRIPT_LINE_BREAK)
-            .append("-- 重要：本脚本仅根据源查询结果元数据生成，工具不会自动执行。").append(SCRIPT_LINE_BREAK)
+            .append("-- 重要：本脚本仅根据源查询结果元数据生成，工具不会未经确认执行；点击执行脚本并再次确认后执行。")
+            .append(SCRIPT_LINE_BREAK)
             .append("-- 执行前必须备份目标表，并由开发/DBA 核对主键、索引、默认值、非空约束、")
             .append("字符集、排序规则和字段注释。").append(SCRIPT_LINE_BREAK)
             .append(SCRIPT_LINE_BREAK)

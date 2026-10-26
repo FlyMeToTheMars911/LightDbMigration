@@ -106,7 +106,7 @@ final class ArchiveStructureValidator {
         checkControl(task);
         if (!issues.isEmpty()) {
             task.setStructureSyncScript(buildScript(databaseType, issues, statements));
-            task.info("已生成归档表结构同步建议脚本，请在任务日志下方审核、复制或下载；工具不会自动执行");
+            task.info("已生成归档表结构同步建议脚本，可在任务日志下方审核、复制、下载或点击执行；工具不会未经确认执行");
             task.error("归档表结构校验未通过，共发现 " + issues.size() + " 个问题：");
             int number = 1;
             for (String issue : issues) {
@@ -553,7 +553,7 @@ final class ArchiveStructureValidator {
     private String buildScript(String databaseType, Set<String> issues, Set<String> statements) {
         StringBuilder script = new StringBuilder("-- Light DB Migration 归档表结构同步建议脚本\n")
             .append("-- 数据库类型：").append(databaseType).append(LINE_BREAK)
-            .append("-- 以源物理表字段为准；工具不会自动执行，归档写入和删除尚未开始。\n")
+            .append("-- 以源物理表字段为准；工具不会未经确认执行，归档写入和删除尚未开始。\n")
             .append("-- 请先备份并核对默认值、自增、主键、索引、字符集、排序规则、长度语义和注释。\n")
             .append("-- 字段数量、名称、类型、精度、小数位及可空性之外的属性不在本次比对范围。\n\n")
             .append("-- 本次校验问题\n");

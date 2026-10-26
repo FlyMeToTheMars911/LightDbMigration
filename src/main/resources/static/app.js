@@ -10,6 +10,13 @@
     var TASK_TYPE_ARCHIVE = 'ARCHIVE';
     var DB_MYSQL = 'MYSQL';
     var DB_ORACLE = 'ORACLE';
+    var TASK_FAILED = 'FAILED';
+    var STRUCTURE_SYNC_READY = 'READY';
+    var STRUCTURE_SYNC_RUNNING = 'RUNNING';
+    var STRUCTURE_SYNC_SUCCEEDED = 'SUCCEEDED';
+    var STRUCTURE_SYNC_FAILED = 'FAILED';
+    var MIN_EXECUTABLE_STATEMENTS = 1;
+    var TYPE_NUMBER = 'number';
     var DATABASE_TYPE_SETTINGS = {
         MYSQL: {port: '3306', label: '数据库名', placeholder: '例如 business_db', jdbcUrl: 'jdbc:mysql://...'},
         ORACLE: {port: '1521', label: '服务名 / SID', placeholder: '例如 ORCL', jdbcUrl: 'jdbc:oracle:thin:@...'},
@@ -22,6 +29,10 @@
         selectedLogs: [],
         selectedTaskName: '',
         selectedStructureSyncScript: '',
+        selectedTaskDetails: null,
+        structureSyncSubmitting: {},
+        structureSyncUncertain: {},
+        logRequestSequence: 0,
         lastLogSequence: 0,
         refreshing: false,
         archiveMainNodeSequence: 0,
@@ -99,6 +110,7 @@
         document.getElementById('closeLogButton').addEventListener('click', closeLogs);
         document.getElementById('copyStructureScriptButton').addEventListener('click', copyStructureScript);
         document.getElementById('downloadStructureScriptButton').addEventListener('click', downloadStructureScript);
+        document.getElementById('executeStructureScriptButton').addEventListener('click', executeStructureScript);
     }
 
     async function checkServer() {
@@ -739,6 +751,7 @@
             state.selectedLogs = [];
             state.selectedTaskName = '';
             state.selectedStructureSyncScript = '';
+            state.selectedTaskDetails = null;
             state.lastLogSequence = 0;
         }
         state.selectedTaskId = id;
@@ -753,6 +766,8 @@
         state.selectedLogs = [];
         state.selectedTaskName = '';
         state.selectedStructureSyncScript = '';
+        state.selectedTaskDetails = null;
+        state.logRequestSequence++;
         state.lastLogSequence = 0;
         document.getElementById('logPanel').classList.add('hidden');
         renderTasks();
@@ -760,9 +775,12 @@
 
     async function refreshSelectedTaskLogs(scrollIntoView) {
         if (!state.selectedTaskId) { return; }
+        var requestedTaskId = state.selectedTaskId;
+        var requestSequence = ++state.logRequestSequence;
         try {
-            var result = await api('/api/tasks/' + encodeURIComponent(state.selectedTaskId)
+            var result = await api('/api/tasks/' + encodeURIComponent(requestedTaskId)
                 + '?afterLog=' + state.lastLogSequence);
+            if (state.selectedTaskId !== requestedTaskId || requestSequence !== state.logRequestSequence) { return; }
             var task = result.data;
             var logs = task.logs || [];
             if (logs.length) {
@@ -771,6 +789,10 @@
             }
             state.selectedTaskName = task.name || 'migration-task';
             state.selectedStructureSyncScript = task.structureSyncScript || '';
+            state.selectedTaskDetails = task;
+            if (task.structureSyncExecution && task.structureSyncExecution.status !== STRUCTURE_SYNC_READY) {
+                delete state.structureSyncUncertain[requestedTaskId];
+            }
             document.getElementById('logTaskName').textContent = task.name + ' · ' + statusName(task.status);
             renderLogs();
             renderStructureSyncScript();
@@ -778,6 +800,7 @@
                 document.getElementById('logPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
             }
         } catch (error) {
+            if (state.selectedTaskId !== requestedTaskId || requestSequence !== state.logRequestSequence) { return; }
             if (error.status === 400) { closeLogs(); }
         }
     }
@@ -797,6 +820,94 @@
         var textarea = document.getElementById('structureSyncScript');
         textarea.value = state.selectedStructureSyncScript;
         panel.classList.toggle('hidden', !state.selectedStructureSyncScript);
+        var task = state.selectedTaskDetails;
+        var execution = task && task.structureSyncExecution ? task.structureSyncExecution : {};
+        var submitting = !!state.structureSyncSubmitting[state.selectedTaskId];
+        var uncertain = !!state.structureSyncUncertain[state.selectedTaskId];
+        var button = document.getElementById('executeStructureScriptButton');
+        button.disabled = !canExecuteStructureScript(task) || submitting || uncertain;
+        button.textContent = submitting || execution.status === STRUCTURE_SYNC_RUNNING ? '执行中…'
+            : execution.status === STRUCTURE_SYNC_SUCCEEDED ? '已执行'
+            : execution.status === STRUCTURE_SYNC_FAILED ? '执行失败' : '执行脚本';
+        var status = document.getElementById('structureSyncExecutionStatus');
+        status.dataset.status = execution.status || '';
+        status.textContent = structureSyncExecutionMessage(execution, submitting, uncertain);
+    }
+
+    /** Params: task 当前查看的任务详情。 Returns: 是否可提交一次结构脚本执行。 */
+    function canExecuteStructureScript(task) {
+        var execution = task && task.structureSyncExecution;
+        return !!(task && task.status === TASK_FAILED && task.structureSyncDigest && execution
+            && execution.status === STRUCTURE_SYNC_READY
+            && execution.totalStatements >= MIN_EXECUTABLE_STATEMENTS);
+    }
+
+    /** Params: execution 执行快照；submitting 请求是否未返回；uncertain 结果是否待核实。 Returns: 页面执行提示。 */
+    function structureSyncExecutionMessage(execution, submitting, uncertain) {
+        var completed = formatNumber(execution.executedStatements || 0);
+        var total = formatNumber(execution.totalStatements || 0);
+        if (execution.status === STRUCTURE_SYNC_SUCCEEDED) {
+            return '执行完成，已成功 ' + completed + ' / ' + total
+                + ' 条。请重新创建任务完成结构预检，再启动迁移或归档。';
+        }
+        if (execution.status === STRUCTURE_SYNC_FAILED) {
+            return (execution.message || '脚本执行失败') + '；已成功 ' + completed + ' / ' + total
+                + ' 条。已生效的 DDL 可能无法回滚，请核对日志后重新创建任务预检。';
+        }
+        if (submitting || execution.status === STRUCTURE_SYNC_RUNNING) {
+            return '脚本执行中，已成功 ' + completed + ' / ' + total + ' 条，请勿重复提交。';
+        }
+        if (uncertain) {
+            return '请求连接中断，执行结果待核实。页面会继续刷新状态，请查看任务日志，勿重复提交。';
+        }
+        if (execution.status === STRUCTURE_SYNC_READY && execution.totalStatements < MIN_EXECUTABLE_STATEMENTS) {
+            return '当前脚本只有人工处理说明，没有可执行的结构语句。';
+        }
+        return '';
+    }
+
+    /** Params: 无。 Returns: 用户二次确认后提交服务端生成的脚本执行请求，不自动重试。 */
+    async function executeStructureScript() {
+        var task = state.selectedTaskDetails;
+        var taskId = state.selectedTaskId;
+        if (!canExecuteStructureScript(task) || state.structureSyncSubmitting[taskId]
+            || state.structureSyncUncertain[taskId]) { return; }
+        var target = task.target || {};
+        var targetLabel = [target.type, target.endpoint, target.username ? '用户 ' + target.username : '']
+            .filter(Boolean).join(' · ');
+        var confirmed = window.confirm('确认执行任务“' + (task.name || taskId) + '”的结构同步脚本？\n'
+            + '目标数据库：' + targetLabel + '\n'
+            + '将执行 ' + formatNumber(task.structureSyncExecution.totalStatements) + ' 条结构语句。'
+            + '请确认已备份并审核脚本；部分 DDL 失败时，之前的修改可能已经生效且无法回滚。\n'
+            + '连接使用上方数据库配置，必须与该任务的目标库一致。执行后不会自动启动数据任务。');
+        if (!confirmed) { return; }
+        var database = databaseConfig(task.taskType === TASK_TYPE_ARCHIVE ? 'source' : 'target');
+        state.structureSyncSubmitting[taskId] = true;
+        renderStructureSyncScript();
+        try {
+            var result = await api('/api/tasks/' + encodeURIComponent(taskId) + '/structure-sync/execute', {
+                method: 'POST',
+                body: JSON.stringify({ confirmed: true, scriptDigest: task.structureSyncDigest, database: database })
+            });
+            if (state.selectedTaskId === taskId && result.data) {
+                state.selectedTaskDetails = result.data;
+                renderStructureSyncScript();
+            }
+            var execution = result.data && result.data.structureSyncExecution;
+            showToast('任务“' + (task.name || taskId) + '”' + (execution
+                && execution.status === STRUCTURE_SYNC_FAILED ? '脚本执行失败，请查看日志' : '脚本执行完成'),
+                execution && execution.status === STRUCTURE_SYNC_FAILED);
+        } catch (error) {
+            if (typeof error.status !== TYPE_NUMBER) { state.structureSyncUncertain[taskId] = true; }
+            showToast('任务“' + (task.name || taskId) + '”：' + error.message + '；请核对执行状态和日志', true);
+        } finally {
+            database.password = null;
+            delete state.structureSyncSubmitting[taskId];
+            if (state.selectedTaskId === taskId) {
+                renderStructureSyncScript();
+                await refreshSelectedTaskLogs();
+            }
+        }
     }
 
     function copyStructureScript() {

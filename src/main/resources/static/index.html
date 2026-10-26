@@ -173,13 +173,15 @@
             <div class="structure-sync-heading">
                 <div>
                     <h3>表结构同步建议脚本</h3>
-                    <p>工具不会自动执行。请先备份目标表，并由开发人员或 DBA 审核后再使用。</p>
+                    <p>请先备份并审核脚本。点击“执行脚本”并再次确认后，才会修改该任务的目标表结构。</p>
                 </div>
                 <div class="structure-sync-actions">
+                    <button type="button" id="executeStructureScriptButton" class="button primary small" disabled>执行脚本</button>
                     <button type="button" id="copyStructureScriptButton" class="button secondary small">复制脚本</button>
                     <button type="button" id="downloadStructureScriptButton" class="button ghost small">下载 SQL</button>
                 </div>
             </div>
+            <p id="structureSyncExecutionStatus" class="structure-sync-execution-status" role="status" aria-live="polite"></p>
             <textarea id="structureSyncScript" class="structure-sync-script" rows="18" readonly spellcheck="false"></textarea>
         </section>
     </section>

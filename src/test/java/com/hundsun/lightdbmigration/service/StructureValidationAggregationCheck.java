@@ -94,7 +94,7 @@ public class StructureValidationAggregationCheck {
 
         Map<String, Object> snapshot = task.snapshot(true, 0L);
         String structureSyncScript = String.valueOf(snapshot.get("structureSyncScript"));
-        assertContains(structureSyncScript, "工具不会自动执行", "同步脚本缺少安全提示");
+        assertContains(structureSyncScript, "工具不会未经确认执行", "同步脚本缺少确认要求");
         assertContains(structureSyncScript,
             "ALTER TABLE `" + TARGET_ONE + "` MODIFY COLUMN `A` VARCHAR(20);",
             "同步脚本缺少文本扩容建议");

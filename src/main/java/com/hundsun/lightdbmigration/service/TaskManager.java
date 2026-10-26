@@ -7,6 +7,7 @@ import com.hundsun.lightdbmigration.model.ArchiveTableRequest;
 import com.hundsun.lightdbmigration.model.LastDatabaseConfig;
 import com.hundsun.lightdbmigration.model.MigrationStepRequest;
 import com.hundsun.lightdbmigration.model.TaskStatus;
+import com.hundsun.lightdbmigration.model.StructureSyncRequest;
 import com.hundsun.lightdbmigration.support.DatabaseSupport;
 import com.hundsun.lightdbmigration.support.MigrationConstants;
 import com.hundsun.lightdbmigration.support.SqlSupport;
@@ -42,6 +43,8 @@ public class TaskManager implements DisposableBean {
     private final ArchiveEngine archiveEngine;
     private final LastDatabaseConfigStore lastDatabaseConfigStore;
     private final ExecutorService executorService;
+    /** 结构建议使用原任务独立状态，不改变原迁移/归档任务执行器。 */
+    private final StructureSyncService structureSyncService = new StructureSyncService();
 
     public TaskManager(MigrationEngine migrationEngine, ArchiveEngine archiveEngine,
         LastDatabaseConfigStore lastDatabaseConfigStore) {
@@ -162,11 +165,28 @@ public class TaskManager implements DisposableBean {
 
     public void delete(String id) {
         MigrationTask task = requireTask(id);
-        if (!task.isTerminal() && task.getStatus() != TaskStatus.CREATED) {
-            throw new IllegalStateException("运行中的任务不能清除，请先终止任务");
+        synchronized (task) {
+            if (task.isStructureSyncRunning()) {
+                throw new IllegalStateException("结构同步正在执行，暂时不能清除该任务");
+            }
+            if (!task.isTerminal() && task.getStatus() != TaskStatus.CREATED) {
+                throw new IllegalStateException("运行中的任务不能清除，请先终止任务");
+            }
+            task.markRemovedFromManager();
+            task.clearPasswords();
+            tasks.remove(id, task);
         }
-        task.clearPasswords();
-        tasks.remove(id, task);
+    }
+
+    /** Params: id 原任务标识；request 已确认的建议摘要及临时连接。 Returns: 含执行结果的任务详情。 */
+    public Map<String, Object> executeStructureSync(String id, StructureSyncRequest request) {
+        try {
+            return structureSyncService.execute(requireTask(id), request);
+        } finally {
+            if (request != null && request.getDatabase() != null) {
+                request.getDatabase().clearPassword();
+            }
+        }
     }
 
     public Map<String, Object> systemInfo() {
@@ -456,10 +476,14 @@ public class TaskManager implements DisposableBean {
             return;
         }
         for (Map.Entry<String, MigrationTask> entry : tasks.entrySet()) {
-            if (entry.getValue().isTerminal()) {
-                tasks.remove(entry.getKey(), entry.getValue());
-                if (tasks.size() < MigrationConstants.MAX_TASKS) {
-                    return;
+            MigrationTask task = entry.getValue();
+            synchronized (task) {
+                if (task.isTerminal() && !task.isStructureSyncRunning()) {
+                    task.markRemovedFromManager();
+                    tasks.remove(entry.getKey(), task);
+                    if (tasks.size() < MigrationConstants.MAX_TASKS) {
+                        return;
+                    }
                 }
             }
         }
