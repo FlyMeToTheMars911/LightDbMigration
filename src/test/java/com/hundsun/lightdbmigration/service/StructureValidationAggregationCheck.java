@@ -12,6 +12,7 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
@@ -46,6 +47,10 @@ public class StructureValidationAggregationCheck {
     private static final String CURSOR_SOURCE = "CURSOR_SOURCE";
     private static final String CURSOR_TARGET = "CURSOR_TARGET";
     private static final long MOCK_BATCH_ELAPSED_MILLIS = 5L;
+    private static final String BROKEN_SOURCE = "BROKEN_SOURCE";
+    private static final int FIRST_NUMERIC_MINIMUM_INDEX = 2;
+    private static final int SECOND_NUMERIC_MINIMUM_INDEX = 4;
+    private static final String JDBC_PREPARE_STATEMENT = "prepareStatement";
 
     private final AtomicInteger sourceMetadataQueries = new AtomicInteger();
     private final AtomicInteger targetMetadataQueries = new AtomicInteger();
@@ -123,6 +128,247 @@ public class StructureValidationAggregationCheck {
         verifyConnectionFailureDetection(engine);
         verifyConfiguredTextCursorAccepted(engine);
         verifyBatchTimingLog(engine);
+        verifyMetadataFailureKeepsLaterSteps(engine);
+        verifyNumericReadFailureKeepsOtherFields(engine);
+        verifyScriptCommentsAndConflictingSuggestions(engine);
+        verifyModifyPreservesTargetConstraints(engine);
+        verifyDefaultNamespaceAliases(engine);
+    }
+
+    private void verifyDefaultNamespaceAliases(MigrationEngine engine) throws Exception {
+        CreateTaskRequest request = new CreateTaskRequest();
+        request.setSource(databaseConfig());
+        request.setTarget(databaseConfig());
+        request.setSteps(Arrays.asList(
+            step("未限定模式", "SELECT NAME FROM " + SOURCE_ONE, TARGET_ONE, null),
+            step("限定默认模式", "SELECT NAME FROM " + SOURCE_TWO, "test_db." + TARGET_ONE, null)));
+        MigrationTask task = new MigrationTask("DEFAULT-NAMESPACE-ALIASES-CHECK", request);
+        Method create = MigrationEngine.class.getDeclaredMethod("createStructureStatements", MigrationTask.class,
+            Connection.class, String.class, List.class);
+        create.setAccessible(true);
+        Class<?> columnMetaClass = Class.forName(MigrationEngine.class.getName() + "$ColumnMeta");
+        Method addColumn = MigrationEngine.class.getDeclaredMethod("addColumnStatement", Set.class,
+            QualifiedName.class, columnMetaClass, String.class);
+        addColumn.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Set<String> statements = (Set<String>)create.invoke(engine, task, connection(false),
+            MigrationConstants.DB_MYSQL, request.getSteps());
+        QualifiedName unqualified = SqlSupport.parseTargetTable(TARGET_ONE);
+        QualifiedName qualified = SqlSupport.parseTargetTable("test_db." + TARGET_ONE);
+        Object column = columnMeta(TARGET_ONE, Types.VARCHAR, "VARCHAR", 20);
+        addColumn.invoke(engine, statements, unqualified, column, MigrationConstants.DB_MYSQL);
+        addColumn.invoke(engine, statements, qualified, column, MigrationConstants.DB_MYSQL);
+        assertEquals(1, statements.size(), "默认模式别名下相同 DDL 未去重");
+        assertContains(statements.iterator().next(), "ALTER TABLE `" + TARGET_ONE + "` ADD COLUMN `" + TARGET_ONE + "`",
+            "归一化冲突键改变了实际输出的表名或同名字段引用");
+        addColumn.invoke(engine, statements, qualified,
+            columnMeta(TARGET_ONE, Types.VARCHAR, "VARCHAR", 40), MigrationConstants.DB_MYSQL);
+        assertContains(statements.toString(), "存在冲突的结构建议", "默认模式别名绕过了字段建议冲突检查");
+        for (String statement : statements) {
+            assertNoExecutableLine(statement, "ALTER TABLE", "默认模式别名下冲突建议仍然可执行");
+        }
+        Connection unreadableNamespace = proxy(Connection.class, (proxy, method, arguments) -> {
+            throw new SQLException("默认库元数据不可读取");
+        });
+        @SuppressWarnings("unchecked")
+        Set<String> ambiguous = (Set<String>)create.invoke(engine, task, unreadableNamespace,
+            MigrationConstants.DB_MYSQL, request.getSteps());
+        addColumn.invoke(engine, ambiguous, unqualified, column, MigrationConstants.DB_MYSQL);
+        addColumn.invoke(engine, ambiguous, qualified,
+            columnMeta(TARGET_ONE, Types.VARCHAR, "VARCHAR", 40), MigrationConstants.DB_MYSQL);
+        assertContains(ambiguous.toString(), "目标默认模式未知", "未知默认库未明确说明别名冲突风险");
+        for (String statement : ambiguous) {
+            assertNoExecutableLine(statement, "ALTER TABLE", "默认库不可读取时仍输出歧义目标的可执行建议");
+        }
+    }
+
+    private void verifyMetadataFailureKeepsLaterSteps(MigrationEngine engine) throws Exception {
+        CreateTaskRequest request = new CreateTaskRequest();
+        request.setSource(databaseConfig());
+        request.setTarget(databaseConfig());
+        request.setSteps(Arrays.asList(
+            step("源字段结构读取失败", "SELECT A FROM " + BROKEN_SOURCE, TARGET_ONE, null),
+            step("后续步骤仍比较", "SELECT X, Y FROM " + SOURCE_TWO, TARGET_TWO, null)));
+        MigrationTask task = new MigrationTask("METADATA-FAILURE-CHECK", request);
+        final Connection delegate = connection(true);
+        Connection source = proxy(Connection.class, new InvocationHandler() {
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] arguments) throws Throwable {
+                if (JDBC_PREPARE_STATEMENT.equals(method.getName())
+                    && String.valueOf(arguments[0]).contains(BROKEN_SOURCE)) {
+                    throw new SQLException("无法读取源查询\r\nDROP TABLE SHOULD_STAY_COMMENT;");
+                }
+                try {
+                    return method.invoke(delegate, arguments);
+                } catch (InvocationTargetException exception) {
+                    throw exception.getCause();
+                }
+            }
+        });
+        Method method = MigrationEngine.class.getDeclaredMethod("prepareAllSteps", MigrationTask.class,
+            Connection.class, Connection.class, String.class, String.class);
+        method.setAccessible(true);
+        try {
+            method.invoke(engine, task, source, connection(false),
+                MigrationConstants.DB_MYSQL, MigrationConstants.DB_MYSQL);
+            throw new AssertionError("源字段结构读取失败应汇总报错");
+        } catch (InvocationTargetException exception) {
+            if (!(exception.getCause() instanceof IllegalArgumentException)) {
+                throw exception;
+            }
+        }
+        String script = String.valueOf(task.snapshot(true, 0L).get("structureSyncScript"));
+        assertContains(script, "源查询无法读取字段结构", "普通元数据错误未收集");
+        assertContains(script, "ALTER TABLE `" + TARGET_TWO + "` ADD COLUMN `Y`",
+            "源字段结构读取失败阻止了后续步骤的结构建议");
+        assertNoExecutableLine(script, "DROP TABLE", "异常消息换行逃逸了 SQL 注释");
+    }
+
+    private void verifyNumericReadFailureKeepsOtherFields(MigrationEngine engine) throws Exception {
+        final ResultSet statistics = proxy(ResultSet.class, new InvocationHandler() {
+            private boolean first = true;
+
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] arguments) throws SQLException {
+                switch (method.getName()) {
+                    case "next":
+                        boolean result = first;
+                        first = false;
+                        return result;
+                    case "getLong":
+                        return MOCK_TOTAL_ROWS;
+                    case "getBigDecimal":
+                        int index = (Integer)arguments[0];
+                        if (index == FIRST_NUMERIC_MINIMUM_INDEX) {
+                            throw new SQLException("A 的最小值无法转换");
+                        }
+                        return index == SECOND_NUMERIC_MINIMUM_INDEX ? BigDecimal.ZERO : new BigDecimal("999");
+                    default:
+                        return defaultValue(method.getReturnType());
+                }
+            }
+        });
+        Connection source = proxy(Connection.class, new InvocationHandler() {
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] arguments) {
+                switch (method.getName()) {
+                    case "prepareStatement":
+                        return proxy(PreparedStatement.class, new InvocationHandler() {
+                            @Override
+                            public Object invoke(Object proxy, Method method, Object[] arguments) {
+                                switch (method.getName()) {
+                                    case "executeQuery":
+                                        return statistics;
+                                    default:
+                                        return defaultValue(method.getReturnType());
+                                }
+                            }
+                        });
+                    default:
+                        return defaultValue(method.getReturnType());
+                }
+            }
+        });
+        Class<?> columnMetaClass = Class.forName(MigrationEngine.class.getName() + "$ColumnMeta");
+        Method compatibility = MigrationEngine.class.getDeclaredMethod("validateTypeCompatibility",
+            columnMetaClass, columnMetaClass, String.class);
+        compatibility.setAccessible(true);
+        List<Object> checks = Arrays.asList(
+            compatibility.invoke(engine, columnMeta("A", Types.NUMERIC, "NUMBER", 20),
+                columnMeta("A", Types.INTEGER, "INTEGER", 10), TARGET_ONE),
+            compatibility.invoke(engine, columnMeta("B", Types.NUMERIC, "NUMBER", 20),
+                columnMeta("B", Types.TINYINT, "TINYINT", 3, DatabaseMetaData.columnNoNulls), TARGET_ONE));
+        Set<String> issues = new LinkedHashSet<>();
+        Set<String> statements = new LinkedHashSet<>();
+        CreateTaskRequest request = new CreateTaskRequest();
+        request.setSteps(Arrays.asList(step("数值范围独立校验", "SELECT A, B FROM NUMERIC_SOURCE", TARGET_ONE, null)));
+        MigrationTask task = new MigrationTask("NUMERIC-READ-FAILURE-CHECK", request);
+        Method statisticsMethod = MigrationEngine.class.getDeclaredMethod("queryCountAndValidateNumericRanges",
+            MigrationTask.class, Connection.class, String.class, String.class, QualifiedName.class, String.class,
+            columnMetaClass, List.class, Set.class, Set.class, String.class);
+        statisticsMethod.setAccessible(true);
+        statisticsMethod.invoke(engine, task, source, "SELECT A, B FROM NUMERIC_SOURCE",
+            MigrationConstants.DB_MYSQL, SqlSupport.parseTargetTable(TARGET_ONE), MigrationConstants.DB_MYSQL,
+            null, checks, issues, statements, "数值步骤");
+        assertEquals(2, issues.size(), "一个数值字段读取失败阻止了其他数值字段的检查");
+        assertLogContains(new ArrayList<>(issues), "字段 A 数值范围读取失败");
+        assertLogContains(new ArrayList<>(issues), "字段 B 源查询实际范围");
+        assertContains(statements.toString(), "MODIFY COLUMN `B` DECIMAL(20,0) NOT NULL;",
+            "后续数值字段超限未生成保留目标非空约束的结构建议");
+    }
+
+    private void verifyModifyPreservesTargetConstraints(MigrationEngine engine) throws Exception {
+        Class<?> columnMetaClass = Class.forName(MigrationEngine.class.getName() + "$ColumnMeta");
+        Method modify = MigrationEngine.class.getDeclaredMethod("addModifyColumnStatement", Set.class,
+            QualifiedName.class, columnMetaClass, columnMetaClass, String.class);
+        modify.setAccessible(true);
+        Object source = columnMeta("NAME", Types.VARCHAR, "VARCHAR", 40);
+        QualifiedName table = SqlSupport.parseTargetTable(TARGET_ONE);
+        Set<String> statements = new LinkedHashSet<>();
+        modify.invoke(engine, statements, table, source,
+            columnMeta("NAME", Types.VARCHAR, "VARCHAR", 10, DatabaseMetaData.columnNoNulls),
+            MigrationConstants.DB_MYSQL);
+        assertContains(statements.toString(), "MODIFY COLUMN `NAME` VARCHAR(40) NOT NULL;",
+            "类型调整建议隐式放宽了目标已有非空约束");
+        statements.clear();
+        modify.invoke(engine, statements, table, source,
+            columnMeta("NAME", Types.VARCHAR, "VARCHAR", 10, DatabaseMetaData.columnNullableUnknown),
+            MigrationConstants.DB_MYSQL);
+        assertContains(statements.toString(), "原有可空约束未知", "约束未知时未提示人工处理");
+        assertNoExecutableLine(statements.iterator().next(), "ALTER TABLE", "约束未知时仍生成了可执行 MODIFY");
+    }
+
+    private void verifyScriptCommentsAndConflictingSuggestions(MigrationEngine engine) throws Exception {
+        Class<?> columnMetaClass = Class.forName(MigrationEngine.class.getName() + "$ColumnMeta");
+        Class<?> statementsClass = Class.forName(MigrationEngine.class.getName() + "$StructureStatements");
+        Constructor<?> statementsConstructor = statementsClass.getDeclaredConstructor();
+        statementsConstructor.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Set<String> statements = (Set<String>)statementsConstructor.newInstance();
+        QualifiedName target = SqlSupport.parseTargetTable(TARGET_ONE);
+        Method addColumn = MigrationEngine.class.getDeclaredMethod("addColumnStatement", Set.class,
+            QualifiedName.class, columnMetaClass, String.class);
+        addColumn.setAccessible(true);
+        Object first = columnMeta("NAME", Types.VARCHAR, "VARCHAR", 20);
+        addColumn.invoke(engine, statements, target, first, MigrationConstants.DB_MYSQL);
+        addColumn.invoke(engine, statements, target, first, MigrationConstants.DB_MYSQL);
+        assertEquals(1, statements.size(), "相同字段建议未去重");
+        addColumn.invoke(engine, statements, target,
+            columnMeta("NAME", Types.VARCHAR, "VARCHAR", 40), MigrationConstants.DB_MYSQL);
+        addColumn.invoke(engine, statements, target,
+            columnMeta("UNSAFE\nDROP TABLE SHOULD_STAY_COMMENT;", Types.OTHER, "OTHER", 0),
+            MigrationConstants.DB_MYSQL);
+        Method buildScript = MigrationEngine.class.getDeclaredMethod("buildStructureSyncScript", String.class,
+            Set.class, Set.class);
+        buildScript.setAccessible(true);
+        String script = (String)buildScript.invoke(engine, MigrationConstants.DB_MYSQL,
+            new LinkedHashSet<>(Arrays.asList("错误\r\nDROP TABLE SHOULD_STAY_COMMENT;\u2028其他错误")), statements);
+        assertContains(script, "存在冲突的结构建议", "跨步骤相同字段的不同建议未提示冲突");
+        assertContains(script, "VARCHAR(20)", "冲突时丢失了第一项建议");
+        assertContains(script, "VARCHAR(40)", "冲突时丢失了后续建议");
+        assertContains(script, "字段名称包含空值或控制字符", "异常元数据字段名称未给人工建议");
+        assertNoExecutableLine(script, "ALTER TABLE", "冲突建议仍生成可执行 DDL");
+        assertNoExecutableLine(script, "DROP TABLE", "元数据字段或异常消息逃逸了 SQL 注释");
+    }
+
+    private Object columnMeta(String name, int jdbcType, String typeName, int precision) throws Exception {
+        return columnMeta(name, jdbcType, typeName, precision, DatabaseMetaData.columnNullable);
+    }
+
+    private Object columnMeta(String name, int jdbcType, String typeName, int precision, int nullable) throws Exception {
+        Class<?> columnMetaClass = Class.forName(MigrationEngine.class.getName() + "$ColumnMeta");
+        Constructor<?> constructor = columnMetaClass.getDeclaredConstructor(String.class, int.class, String.class,
+            int.class, int.class, int.class, boolean.class);
+        constructor.setAccessible(true);
+        return constructor.newInstance(name, jdbcType, typeName, precision, 0, nullable, false);
+    }
+
+    private void assertNoExecutableLine(String script, String prefix, String message) {
+        for (String line : script.split("\\R")) {
+            if (line.trim().startsWith(prefix)) {
+                throw new AssertionError(message + "，实际=" + script);
+            }
+        }
     }
 
     private void verifyBatchTimingLog(MigrationEngine engine) throws Exception {

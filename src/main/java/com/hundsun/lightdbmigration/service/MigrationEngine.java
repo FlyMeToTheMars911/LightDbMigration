@@ -175,8 +175,8 @@ public class MigrationEngine {
         Connection targetConnection, String sourceType, String targetType) throws Exception {
         List<PreparedStep> result = new ArrayList<>();
         Set<String> validationIssues = new LinkedHashSet<>();
-        Set<String> synchronizationStatements = new LinkedHashSet<>();
         List<MigrationStepRequest> steps = task.getRequest().getSteps();
+        Set<String> synchronizationStatements = createStructureStatements(task, targetConnection, targetType, steps);
         for (int i = 0; i < steps.size(); i++) {
             task.checkpoint();
             MigrationStepRequest request = steps.get(i);
@@ -224,6 +224,54 @@ public class MigrationEngine {
                 + " 个问题，已一次性输出到任务日志");
         }
         return result;
+    }
+
+    private StructureStatements createStructureStatements(MigrationTask task, Connection connection,
+        String targetType, List<MigrationStepRequest> steps) throws Exception {
+        String namespace = null;
+        try {
+            namespace = MigrationConstants.DB_MYSQL.equals(targetType)
+                ? connection.getCatalog() : connection.getSchema();
+        } catch (Exception exception) {
+            throwIfControlRequested(task);
+            if (isConnectionFailure(exception)) {
+                throw exception;
+            }
+            task.warn("无法读取目标默认模式，将继续全部步骤的结构检查，存在模式别名歧义的 DDL 仅供人工核对："
+                + SqlSupport.safeMessage(exception));
+        }
+        if (isBlank(namespace) && !MigrationConstants.DB_MYSQL.equals(targetType)) {
+            try {
+                namespace = connection.getMetaData().getUserName();
+            } catch (Exception exception) {
+                throwIfControlRequested(task);
+                if (isConnectionFailure(exception)) {
+                    throw exception;
+                }
+                task.warn("无法读取目标默认模式的备用元数据，将继续结构检查：" + SqlSupport.safeMessage(exception));
+            }
+        }
+        Set<String> ambiguousTables = new LinkedHashSet<>();
+        if (isBlank(namespace)) {
+            Set<String> qualifiedTables = new LinkedHashSet<>();
+            Set<String> unqualifiedTables = new LinkedHashSet<>();
+            for (MigrationStepRequest step : steps) {
+                try {
+                    QualifiedName table = SqlSupport.parseTargetTable(step.getTargetTable());
+                    String name = scriptIdentifier(table.getTable(), targetType);
+                    if (table.getSchema() == null) {
+                        unqualifiedTables.add(name);
+                    } else {
+                        qualifiedTables.add(name);
+                    }
+                } catch (IllegalArgumentException ignored) {
+                    // 各步骤仍会独立报告表名格式错误。
+                }
+            }
+            ambiguousTables.addAll(unqualifiedTables);
+            ambiguousTables.retainAll(qualifiedTables);
+        }
+        return new StructureStatements(isBlank(namespace) ? null : namespace, ambiguousTables);
     }
 
     private PreparedStep prepareStep(MigrationTask task, Connection sourceConnection, Connection targetConnection,
@@ -306,7 +354,7 @@ public class MigrationEngine {
                 }
             } catch (IllegalArgumentException exception) {
                 addValidationIssue(validationIssues, stepLabel, SqlSupport.safeMessage(exception));
-                addModifyColumnStatement(synchronizationStatements, targetName, sourceColumn, targetType);
+                addModifyColumnStatement(synchronizationStatements, targetName, sourceColumn, targetColumn, targetType);
             }
             selectedTargetColumns.add(targetColumn);
             selectedNames.add(normalizedName);
@@ -430,6 +478,11 @@ public class MigrationEngine {
         Set<String> columnNames = new LinkedHashSet<>();
         List<String> definitions = new ArrayList<>();
         for (ColumnMeta sourceColumn : sourceColumns) {
+            if (!isSafeScriptIdentifier(sourceColumn.name)) {
+                statements.add("-- 未生成 " + quotedQualifiedName(targetName, targetType)
+                    + " 的 CREATE TABLE：源查询字段名称包含空值或控制字符，请先修改查询别名。");
+                return;
+            }
             String normalizedName = normalizeName(sourceColumn.name);
             if (!columnNames.add(normalizedName)) {
                 statements.add("-- 未生成 " + quotedQualifiedName(targetName, targetType)
@@ -447,7 +500,8 @@ public class MigrationEngine {
             definitions.add("    " + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition
                 + " NULL");
         }
-        statements.add("-- 已确认目标表确实不存在后再执行；主键、索引和注释需要另行补充。"
+        addStructureStatement(statements, targetName, null, targetType,
+            "-- 已确认目标表确实不存在后再执行；主键、索引和注释需要另行补充。"
             + SCRIPT_LINE_BREAK + "CREATE TABLE " + quotedQualifiedName(targetName, targetType)
             + " (" + SCRIPT_LINE_BREAK + join(definitions, "," + SCRIPT_LINE_BREAK)
             + SCRIPT_LINE_BREAK + ");");
@@ -455,24 +509,32 @@ public class MigrationEngine {
 
     private void addColumnStatement(Set<String> statements, QualifiedName targetName, ColumnMeta sourceColumn,
         String targetType) {
+        if (!canGenerateColumnStatement(statements, targetName, sourceColumn, targetType)) {
+            return;
+        }
         String typeDefinition = targetTypeDefinition(sourceColumn, targetType);
         if (typeDefinition == null) {
             statements.add("-- 目标表 " + quotedQualifiedName(targetName, targetType) + " 缺少字段 "
-                + quotedColumnName(sourceColumn.name, targetType) + "，但源类型 "
+                + sanitizeScriptComment(quotedColumnName(sourceColumn.name, targetType)) + "，但源类型 "
                 + sanitizeScriptComment(sourceColumn.typeName) + " 无法安全映射，请人工补充。");
             return;
         }
         if (MigrationConstants.DB_MYSQL.equals(targetType)) {
-            statements.add("ALTER TABLE " + quotedQualifiedName(targetName, targetType) + " ADD COLUMN "
+            addStructureStatement(statements, targetName, sourceColumn.name, targetType,
+                "ALTER TABLE " + quotedQualifiedName(targetName, targetType) + " ADD COLUMN "
                 + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition + " NULL;");
         } else {
-            statements.add("ALTER TABLE " + quotedQualifiedName(targetName, targetType) + " ADD ("
+            addStructureStatement(statements, targetName, sourceColumn.name, targetType,
+                "ALTER TABLE " + quotedQualifiedName(targetName, targetType) + " ADD ("
                 + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition + " NULL);");
         }
     }
 
     private void addModifyColumnStatement(Set<String> statements, QualifiedName targetName, ColumnMeta sourceColumn,
-        String targetType) {
+        ColumnMeta targetColumn, String targetType) {
+        if (!canGenerateColumnStatement(statements, targetName, sourceColumn, targetType)) {
+            return;
+        }
         String typeDefinition = targetTypeDefinition(sourceColumn, targetType);
         if (typeDefinition == null) {
             statements.add("-- 目标表 " + quotedQualifiedName(targetName, targetType) + " 的字段 "
@@ -481,14 +543,76 @@ public class MigrationEngine {
             return;
         }
         if (MigrationConstants.DB_MYSQL.equals(targetType)) {
-            statements.add("-- MySQL MODIFY COLUMN 可能覆盖原 DEFAULT、COMMENT、字符集等属性，执行前请用 SHOW CREATE TABLE 补齐。"
+            if (targetColumn == null || (targetColumn.nullable != DatabaseMetaData.columnNoNulls
+                && targetColumn.nullable != DatabaseMetaData.columnNullable)) {
+                statements.add("-- 目标表 " + quotedQualifiedName(targetName, targetType) + " 的字段 "
+                    + quotedColumnName(sourceColumn.name, targetType)
+                    + " 原有可空约束未知，无法安全生成 MODIFY；请人工保留原非空约束及其他字段属性后调整类型。");
+                return;
+            }
+            String nullableClause = targetColumn.nullable == DatabaseMetaData.columnNoNulls ? " NOT NULL" : "";
+            addStructureStatement(statements, targetName, sourceColumn.name, targetType,
+                "-- MySQL MODIFY COLUMN 已保留目标非空规则，仍可能覆盖原 DEFAULT、COMMENT、自增和字符集等属性，"
+                + "执行前请用 SHOW CREATE TABLE 补齐。"
                 + SCRIPT_LINE_BREAK + "ALTER TABLE " + quotedQualifiedName(targetName, targetType)
                 + " MODIFY COLUMN " + quotedColumnName(sourceColumn.name, targetType) + " "
-                + typeDefinition + ";");
+                + typeDefinition + nullableClause + ";");
         } else {
-            statements.add("ALTER TABLE " + quotedQualifiedName(targetName, targetType) + " MODIFY ("
+            addStructureStatement(statements, targetName, sourceColumn.name, targetType,
+                "ALTER TABLE " + quotedQualifiedName(targetName, targetType) + " MODIFY ("
                 + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition + ");");
         }
+    }
+
+    private boolean canGenerateColumnStatement(Set<String> statements, QualifiedName targetName,
+        ColumnMeta sourceColumn, String targetType) {
+        if (isSafeScriptIdentifier(sourceColumn.name)) {
+            return true;
+        }
+        statements.add("-- 未生成 " + quotedQualifiedName(targetName, targetType)
+            + " 的字段变更 DDL：源查询字段名称包含空值或控制字符，请先修改查询别名。");
+        return false;
+    }
+
+    private void addStructureStatement(Set<String> statements, QualifiedName table, String columnName,
+        String targetType, String statement) {
+        if (statements instanceof StructureStatements) {
+            StructureStatements suggestions = (StructureStatements)statements;
+            if (suggestions.ambiguousTables.contains(scriptIdentifier(table.getTable(), targetType))) {
+                statements.add("-- 目标默认模式未知，同名表存在限定和未限定模式的配置，无法排除别名冲突；"
+                    + "以下 DDL 仅供人工核对：" + sanitizeScriptComment(statement));
+                return;
+            }
+            String namespace = table.getSchema() == null ? suggestions.namespace : table.getSchema();
+            String canonicalTable = SqlSupport.quoteIdentifier(scriptIdentifier(table.getTable(), targetType), targetType);
+            if (namespace != null) {
+                canonicalTable = SqlSupport.quoteIdentifier(scriptIdentifier(namespace, targetType), targetType)
+                    + "." + canonicalTable;
+            }
+            String objectName = canonicalTable + (columnName == null ? ""
+                : "." + quotedColumnName(normalizeName(columnName), targetType));
+            String quotedTable = quotedQualifiedName(table, targetType);
+            String definition = statement.replace("ALTER TABLE " + quotedTable + " ", "ALTER TABLE " + canonicalTable + " ")
+                .replace("CREATE TABLE " + quotedTable + " ", "CREATE TABLE " + canonicalTable + " ");
+            suggestions.addProposal(objectName, definition, statement);
+        } else {
+            statements.add(statement);
+        }
+    }
+
+    private boolean isSafeScriptIdentifier(String identifier) {
+        if (identifier == null || identifier.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < identifier.length(); i++) {
+            char character = identifier.charAt(i);
+            int characterType = Character.getType(character);
+            if (Character.isISOControl(character) || characterType == Character.LINE_SEPARATOR
+                || characterType == Character.PARAGRAPH_SEPARATOR) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private String targetTypeDefinition(ColumnMeta sourceColumn, String targetType) {
@@ -579,8 +703,18 @@ public class MigrationEngine {
             ? identifier.toUpperCase(Locale.ROOT) : identifier;
     }
 
-    private String sanitizeScriptComment(String value) {
-        return value == null ? "" : value.replace('\r', ' ').replace('\n', ' ');
+    private static String sanitizeScriptComment(String value) {
+        if (value == null) {
+            return "";
+        }
+        StringBuilder result = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char character = value.charAt(i);
+            int characterType = Character.getType(character);
+            result.append(Character.isISOControl(character) || characterType == Character.LINE_SEPARATOR
+                || characterType == Character.PARAGRAPH_SEPARATOR ? ' ' : character);
+        }
+        return result.toString();
     }
 
     private boolean isMissingTable(Exception exception, String targetType) {
@@ -743,7 +877,8 @@ public class MigrationEngine {
             TargetColumnRule rule = rules.get(normalizeName(column.name));
             if (rule != null && !rule.nullable && !rule.autoIncrement && !rule.hasDefault) {
                 addValidationIssue(validationIssues, stepLabel, "目标表必填字段 " + column.name
-                    + " 未包含在源查询结果中，且没有默认值");
+                    + " 未包含在源查询结果中，且没有默认值；请补充源查询字段或人工核对目标默认值/非空约束，"
+                    + "未自动生成放宽约束的 DDL");
             }
         }
     }
@@ -786,7 +921,7 @@ public class MigrationEngine {
     private long queryCountAndValidateNumericRanges(MigrationTask task, Connection connection, String sourceSql,
         String sourceType, QualifiedName targetName, String targetType, ColumnMeta cursorColumn,
         List<NumericRangeCheck> rangeChecks, Set<String> validationIssues,
-        Set<String> synchronizationStatements, String stepLabel) throws SQLException {
+        Set<String> synchronizationStatements, String stepLabel) throws Exception {
         StringBuilder sql = new StringBuilder("SELECT COUNT(*)");
         if (cursorColumn != null) {
             String cursorReference = "LM_STATS." + SqlSupport.quoteIdentifier(cursorColumn.name, sourceType);
@@ -830,17 +965,34 @@ public class MigrationEngine {
                     }
                 }
                 for (NumericRangeCheck rangeCheck : rangeChecks) {
-                    BigDecimal actualMin = resultSet.getBigDecimal(resultIndex++);
-                    BigDecimal actualMax = resultSet.getBigDecimal(resultIndex++);
-                    long fractionalRows = rangeCheck.requireWholeNumberCheck
-                        ? resultSet.getLong(resultIndex++) : NO_FRACTIONAL_ROWS;
+                    int minimumIndex = resultIndex++;
+                    int maximumIndex = resultIndex++;
+                    int fractionalIndex = rangeCheck.requireWholeNumberCheck ? resultIndex++ : -1;
+                    BigDecimal actualMin;
+                    BigDecimal actualMax;
+                    long fractionalRows;
+                    try {
+                        actualMin = resultSet.getBigDecimal(minimumIndex);
+                        actualMax = resultSet.getBigDecimal(maximumIndex);
+                        fractionalRows = rangeCheck.requireWholeNumberCheck
+                            ? resultSet.getLong(fractionalIndex) : NO_FRACTIONAL_ROWS;
+                    } catch (Exception exception) {
+                        throwIfControlRequested(task);
+                        if (isConnectionFailure(exception)) {
+                            throw exception;
+                        }
+                        addValidationIssue(validationIssues, stepLabel, "字段 " + rangeCheck.source.name
+                            + " 数值范围读取失败：" + SqlSupport.safeMessage(exception)
+                            + "；请人工核对该字段数据，继续校验其他字段");
+                        continue;
+                    }
                     try {
                         validateActualNumericRange(task, targetName.toSql(), rangeCheck, actualMin, actualMax,
                             fractionalRows);
                     } catch (IllegalArgumentException exception) {
                         addValidationIssue(validationIssues, stepLabel, SqlSupport.safeMessage(exception));
                         addModifyColumnStatement(synchronizationStatements, targetName, rangeCheck.source,
-                            targetType);
+                            rangeCheck.target, targetType);
                     }
                 }
                 return totalRows;
@@ -1514,6 +1666,49 @@ public class MigrationEngine {
         private static final int TEXT = 2;
         private static final int TIME = 3;
         private static final int BINARY = 4;
+    }
+
+    /**
+     * 汇总同一目标对象的结构建议，发生冲突时仅保留供人工核对的注释。
+     * Author: Codex
+     * date: 2026-10-26
+     */
+    private static final class StructureStatements extends LinkedHashSet<String> {
+        private static final long serialVersionUID = 1L;
+        private final Map<String, String> proposals = new LinkedHashMap<>();
+        private final Map<String, String> definitions = new LinkedHashMap<>();
+        private final Set<String> conflictingObjects = new LinkedHashSet<>();
+        private final String namespace;
+        private final Set<String> ambiguousTables;
+
+        private StructureStatements() {
+            this(null, Collections.<String>emptySet());
+        }
+
+        private StructureStatements(String namespace, Set<String> ambiguousTables) {
+            this.namespace = namespace;
+            this.ambiguousTables = ambiguousTables;
+        }
+
+        private void addProposal(String objectName, String definition, String statement) {
+            if (conflictingObjects.contains(objectName)) {
+                add("-- 冲突候选建议（仅供人工参考）：" + sanitizeScriptComment(statement));
+                return;
+            }
+            String previous = proposals.get(objectName);
+            if (previous == null) {
+                proposals.put(objectName, statement);
+                definitions.put(objectName, definition);
+                add(statement);
+            } else if (!definitions.get(objectName).equals(definition)) {
+                remove(previous);
+                conflictingObjects.add(objectName);
+                add("-- 目标对象 " + sanitizeScriptComment(objectName)
+                    + " 存在冲突的结构建议，已取消该对象的可执行 DDL；请统一各步骤字段定义后人工处理。");
+                add("-- 冲突候选建议（仅供人工参考）：" + sanitizeScriptComment(previous));
+                add("-- 冲突候选建议（仅供人工参考）：" + sanitizeScriptComment(statement));
+            }
+        }
     }
 
     private static final class NumericRange {

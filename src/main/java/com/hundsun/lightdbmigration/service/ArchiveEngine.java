@@ -95,6 +95,7 @@ public class ArchiveEngine {
     }
 
     private PreparedArchive prepare(MigrationTask task, Connection connection, String databaseType) throws Exception {
+        new ArchiveStructureValidator().validate(task, connection, databaseType);
         ArchiveRequest archiveRequest = task.getRequest().getArchive();
         List<PreparedArchiveTable> mainTables = new ArrayList<>();
         List<PreparedArchiveTable> childTables = new ArrayList<>();
