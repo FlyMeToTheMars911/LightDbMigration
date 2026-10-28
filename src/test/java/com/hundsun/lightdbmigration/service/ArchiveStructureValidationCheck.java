@@ -71,6 +71,16 @@ public class ArchiveStructureValidationCheck {
     private static final String DERIVED_QUERY_PREFIX = "FROM (";
     private static final int EXPECTED_METADATA_PHASES = 2;
     private static final long SINGLE_ROW = 1L;
+    private static final int EXPECTED_DM_NUMERIC_COLUMNS = 4;
+    private static final String DM_UNKNOWN_PRECISION_NOTICE = "已兼容 DM 归档查询数值字段的未知精度标记";
+    private static final String MYSQL_COLUMNS_MARKER = "information_schema.COLUMNS";
+    private static final String FIXTURE_SCHEMA = "FIXTURE";
+    private static final String FIXTURE_CATALOG = "fixture_db";
+    private static final int MYSQL_TABLE_BINDING = 2;
+    private static final String ORACLE_INTERVAL_COLUMNS_MARKER = "FROM ALL_TAB_COLUMNS";
+    private static final String INTERVAL_DECLARATION_PREFIX = "INTERVAL";
+    private static final int ORACLE_JDBC_INTERVAL_YEAR_MONTH = -103;
+    private static final int ORACLE_JDBC_INTERVAL_DAY_SECOND = -104;
 
     /**
      * 执行不依赖真实数据库的结构校验回归。
@@ -87,9 +97,18 @@ public class ArchiveStructureValidationCheck {
         verifyOracleAndDmScripts();
         verifySharedTargetNeedsManualHandling();
         verifyOracleUnknownQueryMetadataThroughPrepare();
+        verifyDamengUnknownQueryMetadataThroughPrepare();
         verifyKnownQueryMetadataDifferencesRemainRejected();
         verifyOracleUnknownQueryDoesNotHidePhysicalDifferences();
+        verifyDamengUnknownQueryDoesNotHidePhysicalDifferences();
         verifyNativeTypesProduceExecutableDdl();
+        verifyMysqlEnumAndSetDefinitions();
+        verifyMysqlUnsignedZerofillDefinitions();
+        verifyMysqlLobCapacityIsNotDeclaredPrecision();
+        verifyFloatingDefinitionsCanBeRechecked();
+        verifyPhysicalMetadataSupplementation();
+        verifyQueryUnknownNullableIsNotARealDifference();
+        verifyOracleIntervalDeclarations();
         System.out.println("[RESULT] ARCHIVE_STRUCTURE_VALIDATION_CHECK_PASSED");
     }
 
@@ -366,6 +385,62 @@ public class ArchiveStructureValidationCheck {
     }
 
     /**
+     * 达梦多字段派生查询的未知数值精度和可空性在两个准备阶段都能兼容。
+     * Params: 无。
+     * Returns: 无。
+     */
+    private static void verifyDamengUnknownQueryMetadataThroughPrepare() throws Exception {
+        for (String nativeType : Arrays.asList(NUMBER_TYPE, "DECIMAL")) {
+            for (int jdbcType : Arrays.asList(Types.NUMERIC, Types.DECIMAL)) {
+                for (String queryType : Arrays.asList(NUMBER_TYPE, "DECIMAL", "NUMERIC", "DEC")) {
+                    for (int queryJdbcType : Arrays.asList(Types.NUMERIC, Types.DECIMAL)) {
+                        Fixture fixture = damengQueryFixture(nativeType, jdbcType, queryType, queryJdbcType);
+                        MigrationTask task = task(fixture, MigrationConstants.DB_DM);
+                        Object prepared = prepare(task, fixture, MigrationConstants.DB_DM);
+                        assertTrue(prepared != null, "达梦未知数值精度在最终归档准备阶段仍被拦截: "
+                            + nativeType + ", jdbcType=" + jdbcType + ", queryType=" + queryType
+                            + ", queryJdbcType=" + queryJdbcType);
+                        assertEquals(EXPECTED_METADATA_PHASES, fixture.businessMetadataReads,
+                            "达梦没有同时检查结构预检和最终查询元数据");
+                        assertEquals(FIRST_QUERY, fixture.statisticsQueries, "达梦完整归档准备未校验键范围");
+                        assertTrue(issueLogs(task).isEmpty(), "达梦有效的多字段派生元数据仍被报为差异");
+                        assertSingleDamengUnknownPrecisionNotice(task);
+                        Object script = task.snapshot(true, 0L).get("structureSyncScript");
+                        assertTrue(script == null || String.valueOf(script).isEmpty(),
+                            "达梦有效查询元数据生成了不必要的改表脚本");
+                        for (String sql : fixture.queries) {
+                            if (!sql.contains(BUSINESS_QUERY_MARKER)) {
+                                assertTrue(!sql.contains(DERIVED_QUERY_PREFIX),
+                                    "达梦物理表元数据不能被派生包装丢失真实精度: " + sql);
+                            }
+                        }
+                        assertEquals(NO_WRITES, fixture.writes, "达梦归档准备阶段执行了DDL或数据写删");
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 兼容未知精度只在节点级说明一次，并列出兼容字段数，避免逐字段重复日志。
+     * Params: task 当前达梦归档任务。
+     * Returns: 无。
+     */
+    @SuppressWarnings("unchecked")
+    private static void assertSingleDamengUnknownPrecisionNotice(MigrationTask task) {
+        int notices = 0;
+        List<Map<String, Object>> logs = (List<Map<String, Object>>)task.snapshot(true, 0L).get("logs");
+        for (Map<String, Object> log : logs) {
+            String message = String.valueOf(log.get("message"));
+            if (message.contains(DM_UNKNOWN_PRECISION_NOTICE)) {
+                notices++;
+                assertContains(message, "共 " + EXPECTED_DM_NUMERIC_COLUMNS + " 列", "未知精度兼容字段数量不准确");
+            }
+        }
+        assertEquals(FIRST_QUERY, notices, "同一达梦节点的未知精度兼容说明未按节点汇总一次");
+    }
+
+    /**
      * 已知精度、小数位、原生类型及 JDBC 类型错误不能套用未知元数据兼容规则。
      * Params: 无。
      * Returns: 无。
@@ -379,22 +454,37 @@ public class ArchiveStructureValidationCheck {
             new Column(ID, Types.DECIMAL, NUMBER_TYPE, 0, -127, DatabaseMetaData.columnNullable),
             new Column(ID, Types.VARCHAR, NUMBER_TYPE, 0, -127, DatabaseMetaData.columnNullable));
         for (Column queryColumn : invalid) {
-            Fixture fixture = oracleQueryFixture(queryColumn);
-            MigrationTask task = task(fixture, MigrationConstants.DB_ORACLE);
-            assertTrue(validateFailure(task, fixture, MigrationConstants.DB_ORACLE)
-                instanceof IllegalArgumentException, "已知 Oracle 查询字段定义错误被预检放过");
-            assertContains(issueLogs(task), ID, "Oracle 已知字段定义错误没有汇总");
-            assertFinalQueryValidationRejected(queryColumn, MigrationConstants.DB_ORACLE);
+            assertKnownQueryMetadataRejected(queryColumn, MigrationConstants.DB_ORACLE);
+        }
+        List<Column> invalidDameng = Arrays.asList(
+            new Column(ID, Types.NUMERIC, NUMBER_TYPE, 19, 0, DatabaseMetaData.columnNullable),
+            new Column(ID, Types.NUMERIC, NUMBER_TYPE, 20, 1, DatabaseMetaData.columnNullable),
+            new Column(ID, Types.NUMERIC, NUMBER_TYPE, 0, 0, DatabaseMetaData.columnNullable),
+            new Column(ID, Types.DECIMAL, "DECIMAL", 19, 0, DatabaseMetaData.columnNullable),
+            new Column(ID, Types.DECIMAL, "DECIMAL", 20, 1, DatabaseMetaData.columnNullable),
+            new Column(ID, Types.NUMERIC, "FLOAT", 0, -127, DatabaseMetaData.columnNullable),
+            new Column(ID, Types.FLOAT, NUMBER_TYPE, 0, -127, DatabaseMetaData.columnNullable),
+            new Column(ID, Types.VARCHAR, NUMBER_TYPE, 0, -127, DatabaseMetaData.columnNullable));
+        for (Column queryColumn : invalidDameng) {
+            assertKnownQueryMetadataRejected(queryColumn, MigrationConstants.DB_DM);
         }
         Column oracleUnknown = new Column(ID, Types.NUMERIC, NUMBER_TYPE, 0, -127,
             DatabaseMetaData.columnNullable);
-        for (String databaseType : Arrays.asList(MYSQL, MigrationConstants.DB_DM)) {
-            Fixture fixture = oracleQueryFixture(oracleUnknown);
-            MigrationTask task = task(fixture, databaseType);
-            assertTrue(validateFailure(task, fixture, databaseType) instanceof IllegalArgumentException,
-                databaseType + "错误套用了 Oracle NUMBER 未知精度规则");
-            assertFinalQueryValidationRejected(oracleUnknown, databaseType);
-        }
+        assertKnownQueryMetadataRejected(oracleUnknown, MYSQL);
+    }
+
+    /**
+     * 同时验证汇总预检及引擎最终字段校验拒绝真实的查询字段差异。
+     * Params: queryColumn 查询 ID 字段；databaseType 方言。
+     * Returns: 无。
+     */
+    private static void assertKnownQueryMetadataRejected(Column queryColumn, String databaseType) throws Exception {
+        Fixture fixture = oracleQueryFixture(queryColumn);
+        MigrationTask task = task(fixture, databaseType);
+        assertTrue(validateFailure(task, fixture, databaseType) instanceof IllegalArgumentException,
+            databaseType + "已知查询字段定义错误被预检放过");
+        assertContains(issueLogs(task), ID, databaseType + "已知字段定义错误没有汇总");
+        assertFinalQueryValidationRejected(queryColumn, databaseType);
     }
 
     /**
@@ -415,6 +505,32 @@ public class ArchiveStructureValidationCheck {
         assertExecutableStatement(script(task), "ALTER TABLE \"" + FIRST_TARGET + "\" MODIFY (\""
             + ID + "\" NUMBER(20,0));", "物理字段精度差异没有生成准确的建议 DDL");
         assertEquals(NO_WRITES, fixture.writes, "物理结构不通过时执行了数据变更");
+    }
+
+    /**
+     * 达梦派生查询兼容不改变物理表精度和非空约束的严格比对及 DDL 建议。
+     * Params: 无。
+     * Returns: 无。
+     */
+    private static void verifyDamengUnknownQueryDoesNotHidePhysicalDifferences() throws Exception {
+        List<Column> targets = Arrays.asList(
+            new Column(ID, Types.NUMERIC, NUMBER_TYPE, 19, 0, DatabaseMetaData.columnNoNulls),
+            new Column(ID, Types.NUMERIC, NUMBER_TYPE, 20, 0, DatabaseMetaData.columnNullable),
+            new Column(ID, Types.NUMERIC, NUMBER_TYPE, 19, 0, DatabaseMetaData.columnNullable));
+        for (Column targetId : targets) {
+            Fixture fixture = damengQueryFixture(NUMBER_TYPE, Types.NUMERIC);
+            List<Column> targetColumns = new ArrayList<>(fixture.tables.get(FIRST_TARGET));
+            targetColumns.set(0, targetId);
+            fixture.add(FIRST_TARGET, targetColumns.toArray(new Column[targetColumns.size()]));
+            MigrationTask task = task(fixture, MigrationConstants.DB_DM);
+            assertTrue(validateFailure(task, fixture, MigrationConstants.DB_DM) instanceof IllegalArgumentException,
+                "达梦未知查询元数据掩盖了物理字段的真实精度或非空差异");
+            assertContains(issueLogs(task), ID, "达梦真实物理字段差异未汇总");
+            String nullableClause = targetId.nullable == DatabaseMetaData.columnNullable ? " NOT NULL" : "";
+            assertExecutableStatement(script(task), "ALTER TABLE \"" + FIRST_TARGET + "\" MODIFY (\""
+                + ID + "\" NUMBER(20,0)" + nullableClause + ");", "达梦物理差异未生成准确的建议 DDL");
+            assertEquals(NO_WRITES, fixture.writes, "达梦物理结构失败时执行了数据变更");
+        }
     }
 
     /**
@@ -474,6 +590,427 @@ public class ArchiveStructureValidationCheck {
     }
 
     /**
+     * MySQL 即使把枚举投射为 CHAR，也按完整成员识别差异并保留大小写、转义和顺序。
+     * Params: 无。
+     * Returns: 无。
+     */
+    private static void verifyMysqlEnumAndSetDefinitions() throws Exception {
+        List<String> sourceTypes = Arrays.asList("enum('Blue','O\\'Reilly','Back\\\\Slash')", "set('Red','BLUE')");
+        List<String> targetTypes = Arrays.asList("enum('blue','O\\'Reilly','Back\\\\Slash')", "set('Red','GOLD')");
+        Column projected = new Column("STATE", Types.CHAR, "CHAR", 32, 0, DatabaseMetaData.columnNullable);
+        for (int i = 0; i < sourceTypes.size(); i++) {
+            String nativeBase = sourceTypes.get(i).substring(0, sourceTypes.get(i).indexOf('('))
+                .toUpperCase(Locale.ROOT);
+            Fixture fixture = new Fixture();
+            fixture.add(FIRST_SOURCE, integer(ID), projected);
+            fixture.add(FIRST_TARGET, integer(ID), projected);
+            fixture.catalogDefinitions.put(FIRST_SOURCE, Arrays.asList(integer(ID),
+                new Column(projected.name, Types.CHAR, nativeBase, 32, 0, projected.nullable, sourceTypes.get(i))));
+            fixture.catalogDefinitions.put(FIRST_TARGET, Arrays.asList(integer(ID),
+                new Column(projected.name, Types.CHAR, nativeBase, 32, 0, projected.nullable, targetTypes.get(i))));
+            addMainWithCursor(fixture);
+            MigrationTask task = task(fixture, MYSQL);
+            assertTrue(validateFailure(task, fixture, MYSQL) instanceof IllegalArgumentException,
+                "相同投射长度的 ENUM/SET 成员差异未拦截");
+            assertExecutableStatement(script(task), "ALTER TABLE `" + FIRST_TARGET + "` MODIFY COLUMN `STATE` "
+                + sourceTypes.get(i) + " NULL;", "ENUM/SET MODIFY 丢失原成员大小写或转义");
+            fixture.catalogDefinitions.put(FIRST_TARGET, fixture.catalogDefinitions.get(FIRST_SOURCE));
+            assertTrue(prepare(task(fixture, MYSQL), fixture, MYSQL) != null,
+                "ENUM/SET 成员同步后不能通过完整两阶段归档准备");
+            assertEquals(NO_WRITES, fixture.writes, "ENUM/SET 预检执行了结构或数据变更");
+        }
+        for (boolean missingTable : Arrays.asList(Boolean.FALSE, Boolean.TRUE)) {
+            Fixture fixture = new Fixture();
+            Column enumColumn = new Column("ENUM_VALUE", Types.CHAR, "CHAR", 32, 0,
+                DatabaseMetaData.columnNullable, sourceTypes.get(0));
+            Column setColumn = new Column("SET_VALUE", Types.CHAR, "CHAR", 32, 0,
+                DatabaseMetaData.columnNullable, sourceTypes.get(1));
+            fixture.add(FIRST_SOURCE, integer(ID), enumColumn, setColumn);
+            fixture.add(FIRST_TARGET, integer(ID));
+            if (missingTable) {
+                fixture.tables.put(FIRST_TARGET, null);
+            }
+            fixture.catalogDefinitions.put(FIRST_SOURCE, Arrays.asList(integer(ID),
+                new Column(enumColumn.name, Types.CHAR, "ENUM", 32, 0, enumColumn.nullable, enumColumn.nativeType),
+                new Column(setColumn.name, Types.CHAR, "SET", 32, 0, setColumn.nullable, setColumn.nativeType)));
+            addMainWithCursor(fixture);
+            MigrationTask task = task(fixture, MYSQL);
+            assertTrue(validateFailure(task, fixture, MYSQL) instanceof IllegalArgumentException,
+                "枚举缺表或缺列没有阻止数据执行");
+            if (missingTable) {
+                assertExecutableStatement(script(task), "CREATE TABLE `" + FIRST_TARGET + "` (",
+                    "完整 ENUM/SET 定义未生成建表建议");
+                assertContains(script(task), "`ENUM_VALUE` " + enumColumn.nativeType + " NULL",
+                    "ENUM CREATE 丢失原文定义");
+                assertContains(script(task), "`SET_VALUE` " + setColumn.nativeType + " NULL",
+                    "SET CREATE 丢失原文定义");
+            } else {
+                assertExecutableStatement(script(task), "ALTER TABLE `" + FIRST_TARGET + "` ADD COLUMN `ENUM_VALUE` "
+                    + enumColumn.nativeType + " NULL;", "ENUM ADD 丢失原文定义");
+                assertExecutableStatement(script(task), "ALTER TABLE `" + FIRST_TARGET + "` ADD COLUMN `SET_VALUE` "
+                    + setColumn.nativeType + " NULL;", "SET ADD 丢失原文定义");
+            }
+            fixture.tables.put(FIRST_TARGET, fixture.tables.get(FIRST_SOURCE));
+            fixture.catalogDefinitions.put(FIRST_TARGET, fixture.catalogDefinitions.get(FIRST_SOURCE));
+            assertTrue(prepare(task(fixture, MYSQL), fixture, MYSQL) != null,
+                "枚举增列或建表后不能通过两阶段准备");
+            assertEquals(NO_WRITES, fixture.writes, "枚举增列或建表预检执行了DDL");
+        }
+    }
+
+    /**
+     * 真实数值字段的 UNSIGNED ZEROFILL 修饰必须用于增列、改列和建表，不能被比较拦截后只留注释。
+     * Params: 无。
+     * Returns: 无。
+     */
+    private static void verifyMysqlUnsignedZerofillDefinitions() throws Exception {
+        Column integerValue = new Column("INT_VALUE", Types.INTEGER, "INT UNSIGNED", 10, 0,
+            DatabaseMetaData.columnNullable, "int(10) unsigned zerofill");
+        Column decimalValue = new Column("DEC_VALUE", Types.DECIMAL, "DECIMAL UNSIGNED", 10, 2,
+            DatabaseMetaData.columnNullable, "decimal(10,2) unsigned zerofill");
+        List<Column> sourceCatalog = Arrays.asList(integer(ID),
+            new Column(integerValue.name, Types.INTEGER, "INT", 10, 0, integerValue.nullable, integerValue.nativeType),
+            new Column(decimalValue.name, Types.DECIMAL, "DECIMAL", 10, 2, decimalValue.nullable, decimalValue.nativeType));
+        for (String operation : Arrays.asList("MODIFY", "ADD", "CREATE")) {
+            Fixture fixture = new Fixture();
+            fixture.add(FIRST_SOURCE, integer(ID), integerValue, decimalValue);
+            fixture.catalogDefinitions.put(FIRST_SOURCE, sourceCatalog);
+            switch (operation) {
+                case "MODIFY":
+                    fixture.add(FIRST_TARGET, integer(ID), integerValue, decimalValue);
+                    fixture.catalogDefinitions.put(FIRST_TARGET, Arrays.asList(integer(ID),
+                        new Column(integerValue.name, Types.INTEGER, "INT", 10, 0,
+                            integerValue.nullable, "int(10) unsigned"),
+                        new Column(decimalValue.name, Types.DECIMAL, "DECIMAL", 10, 2,
+                            decimalValue.nullable, "decimal(10,2) unsigned")));
+                    break;
+                case "ADD":
+                    fixture.add(FIRST_TARGET, integer(ID));
+                    fixture.catalogDefinitions.put(FIRST_TARGET, Arrays.asList(integer(ID)));
+                    break;
+                case "CREATE":
+                    fixture.tables.put(FIRST_TARGET, null);
+                    break;
+                default:
+                    throw new AssertionError("未定义的 ZEROFILL 验证场景");
+            }
+            addMainWithCursor(fixture);
+            MigrationTask task = task(fixture, MYSQL);
+            assertTrue(validateFailure(task, fixture, MYSQL) instanceof IllegalArgumentException,
+                "MySQL " + operation + " 未报告真实 ZEROFILL 字段差异");
+            String ddl = script(task);
+            for (Column column : Arrays.asList(integerValue, decimalValue)) {
+                String definition = "`" + column.name + "` " + column.nativeType.toUpperCase(Locale.ROOT) + " NULL";
+                switch (operation) {
+                    case "MODIFY":
+                        assertExecutableStatement(ddl, "ALTER TABLE `" + FIRST_TARGET + "` MODIFY COLUMN "
+                            + definition + ";", "MODIFY 遗漏数值 ZEROFILL 修饰");
+                        break;
+                    case "ADD":
+                        assertExecutableStatement(ddl, "ALTER TABLE `" + FIRST_TARGET + "` ADD COLUMN "
+                            + definition + ";", "ADD 遗漏数值 ZEROFILL 修饰");
+                        break;
+                    case "CREATE":
+                        assertExecutableStatement(ddl, "CREATE TABLE `" + FIRST_TARGET + "` (",
+                            "ZEROFILL 源字段未生成建表建议");
+                        assertContains(ddl, definition, "CREATE 遗漏数值 ZEROFILL 修饰");
+                        break;
+                    default:
+                        throw new AssertionError("未定义的 ZEROFILL 脚本验证场景");
+                }
+            }
+            fixture.tables.put(FIRST_TARGET, fixture.tables.get(FIRST_SOURCE));
+            fixture.catalogDefinitions.put(FIRST_TARGET, fixture.catalogDefinitions.get(FIRST_SOURCE));
+            assertTrue(prepare(task(fixture, MYSQL), fixture, MYSQL) != null,
+                "MySQL ZEROFILL 字段同步后两阶段准备仍不能通过: " + operation);
+            assertEquals(NO_WRITES, fixture.writes, "ZEROFILL 结构预检执行了DDL或数据变更");
+        }
+    }
+
+    /**
+     * MySQL 同型 TEXT/BLOB 的字符集容量投射不构成声明差异，真实非空和 VARCHAR 长度差异仍报告。
+     * Params: 无。
+     * Returns: 无。
+     */
+    private static void verifyMysqlLobCapacityIsNotDeclaredPrecision() throws Exception {
+        for (String type : Arrays.asList("TEXT", "BLOB")) {
+            int jdbcType = type.equals("TEXT") ? Types.LONGVARCHAR : Types.BLOB;
+            Column source = new Column("PAYLOAD", jdbcType, type, 65535, 0,
+                DatabaseMetaData.columnNullable, type.toLowerCase(Locale.ROOT));
+            Column target = new Column("PAYLOAD", jdbcType, type, 16383, 0,
+                DatabaseMetaData.columnNullable, type.toLowerCase(Locale.ROOT));
+            Fixture fixture = new Fixture();
+            fixture.add(FIRST_SOURCE, integer(ID), source);
+            fixture.add(FIRST_TARGET, integer(ID), target);
+            fixture.catalogDefinitions.put(FIRST_SOURCE, fixture.tables.get(FIRST_SOURCE));
+            fixture.catalogDefinitions.put(FIRST_TARGET, fixture.tables.get(FIRST_TARGET));
+            addMainWithCursor(fixture);
+            MigrationTask compatible = task(fixture, MYSQL);
+            assertTrue(prepare(compatible, fixture, MYSQL) != null,
+                "同型 MySQL " + type + " 因派生容量不同在两阶段准备中被误拦截");
+            assertTrue(issueLogs(compatible).isEmpty(), "TEXT/BLOB 容量投射被报为真实字段差异");
+            fixture.add(FIRST_TARGET, integer(ID), new Column("PAYLOAD", jdbcType, type, 16383, 0,
+                DatabaseMetaData.columnNoNulls, type.toLowerCase(Locale.ROOT)));
+            fixture.catalogDefinitions.put(FIRST_TARGET, fixture.tables.get(FIRST_TARGET));
+            MigrationTask nullableDifference = task(fixture, MYSQL);
+            assertTrue(validateFailure(nullableDifference, fixture, MYSQL) instanceof IllegalArgumentException,
+                "同型 TEXT/BLOB 容量兼容掩盖了真实非空差异");
+            assertExecutableStatement(script(nullableDifference), "ALTER TABLE `" + FIRST_TARGET
+                + "` MODIFY COLUMN `PAYLOAD` " + type + " NULL;", "真实 TEXT/BLOB 非空差异没有建议 DDL");
+            assertEquals(NO_WRITES, fixture.writes, "TEXT/BLOB 字段预检执行了结构或数据变更");
+        }
+        assertTrue(!ArchiveStructureValidator.samePhysicalPrecision(MYSQL, 30, 10, "varchar(30)", "varchar(30)"),
+            "仅容量投射兼容不应扩展到 VARCHAR 的真实声明精度");
+        Fixture varcharFixture = new Fixture();
+        varcharFixture.add(FIRST_SOURCE, integer(ID), new Column(NAME, Types.VARCHAR, TEXT_TYPE, 30, 0,
+            DatabaseMetaData.columnNullable, "varchar(30)"));
+        varcharFixture.add(FIRST_TARGET, integer(ID), new Column(NAME, Types.VARCHAR, TEXT_TYPE, 10, 0,
+            DatabaseMetaData.columnNullable, "varchar(10)"));
+        varcharFixture.catalogDefinitions.put(FIRST_SOURCE, varcharFixture.tables.get(FIRST_SOURCE));
+        varcharFixture.catalogDefinitions.put(FIRST_TARGET, varcharFixture.tables.get(FIRST_TARGET));
+        addMainWithCursor(varcharFixture);
+        MigrationTask varcharDifference = task(varcharFixture, MYSQL);
+        assertTrue(validateFailure(varcharDifference, varcharFixture, MYSQL) instanceof IllegalArgumentException,
+            "MySQL VARCHAR 长度差异被容量兼容规则错误忽略");
+        assertExecutableStatement(script(varcharDifference), "ALTER TABLE `" + FIRST_TARGET
+            + "` MODIFY COLUMN `NAME` VARCHAR(30) NULL;", "VARCHAR 真实长度差异没有 MODIFY 建议");
+        assertEquals(NO_WRITES, varcharFixture.writes, "VARCHAR 预检执行了结构或数据变更");
+    }
+
+    /**
+     * 浮点真实精度必须写入建议，协议 scale=31 不能拼成无效 FLOAT(M,31)。
+     * Params: 无。
+     * Returns: 无。
+     */
+    private static void verifyFloatingDefinitionsCanBeRechecked() throws Exception {
+        verifyFloatingPair(MigrationConstants.DB_ORACLE,
+            new Column("RATE", Types.FLOAT, "FLOAT", 20, -127, DatabaseMetaData.columnNullable),
+            new Column("RATE", Types.FLOAT, "FLOAT", 126, -127, DatabaseMetaData.columnNullable), "FLOAT(20)");
+        verifyFloatingPair(MigrationConstants.DB_ORACLE,
+            new Column("RATE", Types.FLOAT, "FLOAT", 126, -127, DatabaseMetaData.columnNullable),
+            new Column("RATE", Types.FLOAT, "FLOAT", 20, -127, DatabaseMetaData.columnNullable), "FLOAT(126)");
+        Column fixed = new Column("RATE", Types.FLOAT, "FLOAT", 10, 2, DatabaseMetaData.columnNullable, "float(10,2)");
+        Column protocol = new Column("RATE", Types.FLOAT, "FLOAT", 12, 31,
+            DatabaseMetaData.columnNullable, "float");
+        verifyFloatingPair(MYSQL, fixed, protocol, "FLOAT(10,2)");
+        verifyFloatingPair(MYSQL, protocol, fixed, "FLOAT");
+    }
+
+    /**
+     * 对浮点差异校验建议原文，并模拟目标应用源定义后通过完整准备。
+     * Params: databaseType 方言；source/target 两侧 RATE 字段；expectedType 建议类型。
+     * Returns: 无。
+     */
+    private static void verifyFloatingPair(String databaseType, Column source, Column target, String expectedType)
+        throws Exception {
+        Fixture fixture = new Fixture();
+        fixture.add(FIRST_SOURCE, integer(ID), source);
+        fixture.add(FIRST_TARGET, integer(ID), target);
+        fixture.catalogDefinitions.put(FIRST_SOURCE, fixture.tables.get(FIRST_SOURCE));
+        fixture.catalogDefinitions.put(FIRST_TARGET, fixture.tables.get(FIRST_TARGET));
+        addMainWithCursor(fixture);
+        MigrationTask task = task(fixture, databaseType);
+        assertTrue(validateFailure(task, fixture, databaseType) instanceof IllegalArgumentException,
+            databaseType + " FLOAT 真实精度差异没有拦截");
+        boolean mysql = MYSQL.equals(databaseType);
+        String statement = mysql ? "ALTER TABLE `" + FIRST_TARGET + "` MODIFY COLUMN `RATE` " + expectedType + " NULL;"
+            : "ALTER TABLE \"" + FIRST_TARGET + "\" MODIFY (\"RATE\" " + expectedType + ");";
+        assertExecutableStatement(script(task), statement, databaseType + "浮点建议丢失真实精度或误用了协议scale");
+        fixture.tables.put(FIRST_TARGET, fixture.tables.get(FIRST_SOURCE));
+        fixture.catalogDefinitions.put(FIRST_TARGET, fixture.catalogDefinitions.get(FIRST_SOURCE));
+        assertTrue(prepare(task(fixture, databaseType), fixture, databaseType) != null,
+            databaseType + "浮点同步后完整归档准备仍失败");
+        assertEquals(NO_WRITES, fixture.writes, "浮点预检执行了结构或数据写入");
+    }
+
+    /**
+     * 三种数据库从受限物理目录补齐缺类型和未知可空性，建议和最终准备必须一致。
+     * Params: 无。
+     * Returns: 无。
+     */
+    private static void verifyPhysicalMetadataSupplementation() throws Exception {
+        for (String databaseType : Arrays.asList(MYSQL, MigrationConstants.DB_ORACLE, MigrationConstants.DB_DM)) {
+            Fixture fixture = new Fixture();
+            boolean mysql = MYSQL.equals(databaseType);
+            String type = MigrationConstants.DB_ORACLE.equals(databaseType) ? ORACLE_TEXT_TYPE : TEXT_TYPE;
+            Column incomplete = new Column(NAME, mysql ? Types.VARCHAR : Types.OTHER, "", 0, 0,
+                DatabaseMetaData.columnNullableUnknown);
+            Column actualSource = new Column(NAME, Types.VARCHAR, type, 30, 0,
+                DatabaseMetaData.columnNullable, mysql ? "varchar(30)" : null);
+            Column actualTarget = new Column(NAME, Types.VARCHAR, type, 10, 0,
+                DatabaseMetaData.columnNoNulls, mysql ? "varchar(10)" : null);
+            fixture.add(FIRST_SOURCE, integer(ID), incomplete);
+            fixture.add(FIRST_TARGET, integer(ID), incomplete);
+            fixture.catalogDefinitions.put(FIRST_SOURCE, Arrays.asList(integer(ID), actualSource));
+            fixture.catalogDefinitions.put(FIRST_TARGET, Arrays.asList(integer(ID), actualTarget));
+            fixture.businessColumns = Arrays.asList(integer(ID), actualSource);
+            addMainWithCursor(fixture);
+            MigrationTask task = task(fixture, databaseType);
+            assertTrue(validateFailure(task, fixture, databaseType) instanceof IllegalArgumentException,
+                databaseType + "目录补齐后真实长度/可空差异未拦截");
+            String statement = mysql ? "ALTER TABLE `" + FIRST_TARGET + "` MODIFY COLUMN `NAME` VARCHAR(30) NULL;"
+                : "ALTER TABLE \"" + FIRST_TARGET + "\" MODIFY (\"NAME\" " + type + "(30) NULL);";
+            assertExecutableStatement(script(task), statement, databaseType + "补齐的真实物理定义未用于生成DDL");
+            fixture.catalogDefinitions.put(FIRST_TARGET, fixture.catalogDefinitions.get(FIRST_SOURCE));
+            assertTrue(prepare(task(fixture, databaseType), fixture, databaseType) != null,
+                databaseType + "最终准备未使用相同补齐定义");
+            assertEquals(NO_WRITES, fixture.writes, "物理目录补齐期间执行了结构或数据变更");
+        }
+    }
+
+    /**
+     * 查询未知可空性不构成真实字段差异，MySQL 明确已知的可空性冲突仍须拒绝。
+     * Params: 无。
+     * Returns: 无。
+     */
+    private static void verifyQueryUnknownNullableIsNotARealDifference() throws Exception {
+        for (String databaseType : Arrays.asList(MYSQL, MigrationConstants.DB_ORACLE, MigrationConstants.DB_DM)) {
+            Fixture fixture = new Fixture();
+            Column name = new Column(NAME, Types.VARCHAR, TEXT_TYPE, 20, 0, DatabaseMetaData.columnNoNulls);
+            fixture.add(FIRST_SOURCE, integer(ID), name);
+            fixture.add(FIRST_TARGET, integer(ID), name);
+            fixture.businessColumns = Arrays.asList(
+                new Column(ID, Types.INTEGER, INTEGER_TYPE, 10, 0, DatabaseMetaData.columnNullableUnknown),
+                new Column(NAME, Types.VARCHAR, TEXT_TYPE, 20, 0, DatabaseMetaData.columnNullableUnknown));
+            addMainWithCursor(fixture);
+            assertTrue(prepare(task(fixture, databaseType), fixture, databaseType) != null,
+                databaseType + "查询未知可空性被当成真实差异");
+            if (MYSQL.equals(databaseType)) {
+                fixture.businessColumns = Arrays.asList(integer(ID),
+                    new Column(NAME, Types.VARCHAR, TEXT_TYPE, 20, 0, DatabaseMetaData.columnNullable));
+                assertTrue(validateFailure(task(fixture, MYSQL), fixture, MYSQL) instanceof IllegalArgumentException,
+                    "MySQL 已知查询可空性冲突被忽略");
+                assertFinalQueryValidationRejected(new Column(ID, Types.NUMERIC, NUMBER_TYPE, 20, 0,
+                    DatabaseMetaData.columnNullable), MYSQL);
+            }
+            assertEquals(NO_WRITES, fixture.writes, "查询可空性校验执行了数据变更");
+        }
+    }
+
+    /**
+     * Oracle INTERVAL 只使用目录真实声明精度；驱动 5/11 字节长度不能变成 YEAR/DAY 精度。
+     * Params: 无。
+     * Returns: 无。
+     */
+    private static void verifyOracleIntervalDeclarations() throws Exception {
+        for (String operation : Arrays.asList("MODIFY", "ADD", "CREATE")) {
+            verifyOracleIntervalOperation(operation, "INTERVAL YEAR(3) TO MONTH", "INTERVAL DAY(4) TO SECOND(7)");
+        }
+        verifyOracleIntervalOperation("MODIFY", "INTERVAL YEAR(0) TO MONTH", "INTERVAL DAY(0) TO SECOND(0)");
+        Fixture incomplete = new Fixture();
+        Column year = intervalYearColumn(null);
+        Column day = intervalDayColumn(null);
+        incomplete.add(FIRST_SOURCE, integer(ID), year, day);
+        incomplete.add(FIRST_TARGET, integer(ID));
+        incomplete.catalogDefinitions.put(FIRST_SOURCE, incomplete.tables.get(FIRST_SOURCE));
+        addMainWithCursor(incomplete);
+        MigrationTask task = task(incomplete, MigrationConstants.DB_ORACLE);
+        assertTrue(validateFailure(task, incomplete, MigrationConstants.DB_ORACLE) instanceof IllegalArgumentException,
+            "缺真实 INTERVAL 声明的字段没有报告缺列");
+        for (String line : script(task).split("\\r?\\n")) {
+            String statement = line.trim();
+            assertTrue(statement.startsWith("--") || !statement.contains(INTERVAL_DECLARATION_PREFIX),
+                "把驱动字节长度或默认精度虚构成可执行 INTERVAL 定义: " + line);
+        }
+        assertEquals(NO_WRITES, incomplete.writes, "缺失 INTERVAL 目录定义时执行了结构或数据变更");
+    }
+
+    /**
+     * 验证 INTERVAL 三种建议路径，并在模拟目录同步后重新完成两阶段准备。
+     * Params: operation MODIFY/ADD/CREATE；yearDeclaration 真实 YEAR 声明；dayDeclaration 真实 DAY 声明。
+     * Returns: 无。
+     */
+    private static void verifyOracleIntervalOperation(String operation, String yearDeclaration,
+        String dayDeclaration) throws Exception {
+        Fixture fixture = new Fixture();
+        fixture.add(FIRST_SOURCE, integer(ID), intervalYearColumn(null), intervalDayColumn(null));
+        fixture.catalogDefinitions.put(FIRST_SOURCE, Arrays.asList(integer(ID),
+            intervalYearColumn(yearDeclaration), intervalDayColumn(dayDeclaration)));
+        switch (operation) {
+            case "MODIFY":
+                fixture.add(FIRST_TARGET, integer(ID), intervalYearColumn(null), intervalDayColumn(null));
+                fixture.catalogDefinitions.put(FIRST_TARGET, Arrays.asList(integer(ID),
+                    intervalYearColumn("INTERVAL YEAR(2) TO MONTH"),
+                    intervalDayColumn("INTERVAL DAY(2) TO SECOND(6)")));
+                break;
+            case "ADD":
+                fixture.add(FIRST_TARGET, integer(ID));
+                break;
+            case "CREATE":
+                fixture.tables.put(FIRST_TARGET, null);
+                fixture.missingState = "42000";
+                fixture.missingCode = ORACLE_MISSING_CODE;
+                break;
+            default:
+                throw new AssertionError("未定义的 INTERVAL 验证场景");
+        }
+        addMainWithCursor(fixture);
+        MigrationTask task = task(fixture, MigrationConstants.DB_ORACLE);
+        assertTrue(validateFailure(task, fixture, MigrationConstants.DB_ORACLE) instanceof IllegalArgumentException,
+            "Oracle " + operation + " 未报告真实 INTERVAL 字段差异");
+        String ddl = script(task);
+        for (Column column : fixture.catalogDefinitions.get(FIRST_SOURCE)) {
+            if (column.nativeType != null) {
+                String definition = "\"" + column.name + "\" " + column.nativeType;
+                switch (operation) {
+                    case "MODIFY":
+                        assertExecutableStatement(ddl, "ALTER TABLE \"" + FIRST_TARGET + "\" MODIFY ("
+                            + definition + ");", "INTERVAL MODIFY 未使用目录真实声明精度");
+                        break;
+                    case "ADD":
+                        assertExecutableStatement(ddl, "ALTER TABLE \"" + FIRST_TARGET + "\" ADD ("
+                            + definition + " NULL);", "INTERVAL ADD 未使用目录真实声明精度");
+                        break;
+                    case "CREATE":
+                        assertExecutableStatement(ddl, "CREATE TABLE \"" + FIRST_TARGET + "\" (",
+                            "INTERVAL 缺表未生成建表建议");
+                        assertContains(ddl, definition + " NULL", "INTERVAL CREATE 丢失目录真实精度");
+                        break;
+                    default:
+                        throw new AssertionError("未定义的 INTERVAL 脚本验证场景");
+                }
+            }
+        }
+        fixture.tables.put(FIRST_TARGET, fixture.tables.get(FIRST_SOURCE));
+        fixture.catalogDefinitions.put(FIRST_TARGET, fixture.catalogDefinitions.get(FIRST_SOURCE));
+        assertTrue(prepare(task(fixture, MigrationConstants.DB_ORACLE), fixture, MigrationConstants.DB_ORACLE) != null,
+            "Oracle INTERVAL 目录同步后完整两阶段准备仍失败: " + operation);
+        assertEquals(NO_WRITES, fixture.writes, "INTERVAL 预检执行了结构或数据变更");
+    }
+
+    /**
+     * Oracle JDBC 将 YEAR TO MONTH 元数据精度投射为存储字节数 5。
+     * Params: declaration 目录真实声明，缺失时为 null。
+     * Returns: 原始驱动元数据及独立目录声明。
+     */
+    private static Column intervalYearColumn(String declaration) {
+        return new Column("YM_VALUE", ORACLE_JDBC_INTERVAL_YEAR_MONTH, "INTERVALYM", 5, 0,
+            DatabaseMetaData.columnNullable, declaration);
+    }
+
+    /**
+     * Oracle JDBC 将 DAY TO SECOND 元数据精度投射为存储字节数 11。
+     * Params: declaration 目录真实声明，缺失时为 null。
+     * Returns: 原始驱动元数据及独立目录声明。
+     */
+    private static Column intervalDayColumn(String declaration) {
+        return new Column("DS_VALUE", ORACLE_JDBC_INTERVAL_DAY_SECOND, "INTERVALDS", 11, 0,
+            DatabaseMetaData.columnNullable, declaration);
+    }
+
+    /**
+     * 为单表场景配置显式游标和可独立模拟的业务查询。
+     * Params: fixture 当前验证数据。
+     * Returns: 无。
+     */
+    private static void addMainWithCursor(Fixture fixture) {
+        ArchiveTableRequest main = table(FIRST_SOURCE, FIRST_TARGET, "ROOT", null);
+        main.setCursorColumn(ID);
+        main.setSourceSql("SELECT * FROM " + FIRST_SOURCE + " /* " + BUSINESS_QUERY_MARKER + " */");
+        fixture.mains.add(main);
+    }
+
+    /**
      * 独立调用引擎最终查询字段校验，防止两阶段兼容规则不一致。
      * Params: queryColumn 业务查询的 ID 字段；databaseType 方言。
      * Returns: 无。
@@ -517,6 +1054,45 @@ public class ArchiveStructureValidationCheck {
             new Column(NAME, Types.VARCHAR, ORACLE_TEXT_TYPE, 30, 0, DatabaseMetaData.columnNullable));
         ArchiveTableRequest main = table(FIRST_SOURCE, FIRST_TARGET, "ROOT", null);
         main.setSourceSql("SELECT ID, NAME FROM " + FIRST_SOURCE + " /* " + BUSINESS_QUERY_MARKER + " */");
+        main.setCursorColumn(ID);
+        fixture.mains.add(main);
+        return fixture;
+    }
+
+    /**
+     * 构造截图对应的四种物理数值精度，并让业务派生查询统一返回未知精度。
+     * Params: nativeType NUMBER 或 DECIMAL 原生类型；jdbcType 同侧精确数值 JDBC 类型。
+     * Returns: 物理元数据与业务查询元数据独立的达梦 JDBC 数据。
+     */
+    private static Fixture damengQueryFixture(String nativeType, int jdbcType) {
+        return damengQueryFixture(nativeType, jdbcType, nativeType, jdbcType);
+    }
+
+    /**
+     * 构造物理列和查询列原生类型/JDBC 同义表示不同的达梦驱动元数据。
+     * Params: nativeType/jdbcType 物理数值字段类型；queryType/queryJdbcType 查询数值字段类型。
+     * Returns: 独立的物理与业务查询验证数据。
+     */
+    private static Fixture damengQueryFixture(String nativeType, int jdbcType, String queryType, int queryJdbcType) {
+        Fixture fixture = new Fixture();
+        List<Column> physical = Arrays.asList(
+            new Column(ID, jdbcType, nativeType, 20, 0, DatabaseMetaData.columnNoNulls),
+            new Column("RECORD_ID", jdbcType, nativeType, 14, 0, DatabaseMetaData.columnNoNulls),
+            new Column("COUNT_NO", jdbcType, nativeType, 8, 0, DatabaseMetaData.columnNullable),
+            new Column(AMOUNT_COLUMN, jdbcType, nativeType, 12, 4, DatabaseMetaData.columnNullable),
+            new Column(NAME, Types.VARCHAR, TEXT_TYPE, 30, 0, DatabaseMetaData.columnNoNulls));
+        fixture.add(FIRST_SOURCE, physical.toArray(new Column[physical.size()]));
+        fixture.add(FIRST_TARGET, physical.toArray(new Column[physical.size()]));
+        fixture.businessColumns = new ArrayList<>();
+        for (Column column : physical) {
+            boolean numeric = column.jdbcType == Types.NUMERIC || column.jdbcType == Types.DECIMAL;
+            fixture.businessColumns.add(new Column(column.name, numeric ? queryJdbcType : column.jdbcType,
+                numeric ? queryType : column.typeName,
+                numeric ? 0 : column.precision, numeric ? -127 : column.scale, DatabaseMetaData.columnNullable));
+        }
+        ArchiveTableRequest main = table(FIRST_SOURCE, FIRST_TARGET, "ROOT", null);
+        main.setSourceSql("SELECT ID, RECORD_ID, COUNT_NO, AMOUNT, NAME FROM " + FIRST_SOURCE
+            + " /* " + BUSINESS_QUERY_MARKER + " */");
         main.setCursorColumn(ID);
         fixture.mains.add(main);
         return fixture;
@@ -740,6 +1316,8 @@ public class ArchiveStructureValidationCheck {
     private static final class Fixture {
         /** 物理表字段，null 表示该表不存在。 */
         private final Map<String, List<Column>> tables = new LinkedHashMap<>();
+        /** 与驱动零行字段投射独立的完整物理字段目录。 */
+        private final Map<String, List<Column>> catalogDefinitions = new LinkedHashMap<>();
         /** 主表节点。 */
         private final List<ArchiveTableRequest> mains = new ArrayList<>();
         /** 子表节点。 */
@@ -787,9 +1365,11 @@ public class ArchiveStructureValidationCheck {
                     case "createStatement":
                         throw new AssertionError("预检不应创建可执行任意写入的 Statement");
                     case "getCatalog":
-                        return "fixture_db";
+                        return FIXTURE_CATALOG;
                     case "getSchema":
-                        return "FIXTURE";
+                        return FIXTURE_SCHEMA;
+                    case "getMetaData":
+                        return databaseMetadata();
                     case "hashCode":
                         return System.identityHashCode(object);
                     case "equals":
@@ -806,10 +1386,15 @@ public class ArchiveStructureValidationCheck {
          * Returns: 预编译语句代理。
          */
         private PreparedStatement statement(final String sql) {
+            final Map<Integer, Object> parameters = new LinkedHashMap<>();
             return proxy(PreparedStatement.class, (object, method, arguments) -> {
                 switch (method.getName()) {
+                    case "setString":
+                    case "setObject":
+                        parameters.put((Integer)arguments[0], arguments[1]);
+                        return null;
                     case "executeQuery":
-                        return query(sql);
+                        return query(sql, parameters);
                     case "execute":
                     case "executeUpdate":
                     case "executeBatch":
@@ -833,10 +1418,18 @@ public class ArchiveStructureValidationCheck {
          * Params: sql 查询。
          * Returns: 零行结果集。
          */
-        private ResultSet query(String sql) throws SQLException {
+        private ResultSet query(String sql, Map<Integer, Object> parameters) throws SQLException {
             queries.add(sql);
             assertTrue(sql.trim().toUpperCase(Locale.ROOT).startsWith(SELECT_PREFIX),
                 "预检不是 SELECT 查询: " + sql);
+            if (sql.contains(MYSQL_COLUMNS_MARKER)) {
+                String table = String.valueOf(parameters.get(MYSQL_TABLE_BINDING));
+                return catalogRows(table);
+            }
+            if (sql.contains(ORACLE_INTERVAL_COLUMNS_MARKER)) {
+                String table = String.valueOf(parameters.get(MYSQL_TABLE_BINDING));
+                return catalogRows(table, true);
+            }
             if (sql.trim().toUpperCase(Locale.ROOT).startsWith(COUNT_QUERY_PREFIX)) {
                 statisticsQueries++;
                 final boolean[] firstRow = {true};
@@ -879,6 +1472,100 @@ public class ArchiveStructureValidationCheck {
                 }
             }
             throw new AssertionError("意外查询: " + sql);
+        }
+
+        /**
+         * 提供 Oracle/达梦补读所需的精确表字段目录 API。
+         * Params: 无。
+         * Returns: JDBC 字段目录代理。
+         */
+        private DatabaseMetaData databaseMetadata() {
+            return proxy(DatabaseMetaData.class, (object, method, arguments) -> {
+                switch (method.getName()) {
+                    case "getUserName": return FIXTURE_SCHEMA;
+                    case "getSearchStringEscape": return "\\";
+                    case "getColumns":
+                        String tablePattern = String.valueOf(arguments[2]);
+                        return catalogRows(tablePattern.replace("\\_", "_").replace("\\%", "%"));
+                    default: return defaultValue(method.getReturnType());
+                }
+            });
+        }
+
+        /**
+         * 同时支持 MySQL COLUMN_TYPE SQL 与 JDBC getColumns 的独立真实物理定义。
+         * Params: table 已绑定或模式转义还原后的物理表名。
+         * Returns: 字段目录结果；没有登记的表返回空目录，不凭空构造定义。
+         */
+        private ResultSet catalogRows(String table) {
+            return catalogRows(table, false);
+        }
+
+        /**
+         * 字段目录与 Oracle INTERVAL 声明目录分别返回，后者绝不以驱动字节长度替代声明。
+         * Params: table 物理表；intervalDictionary 是否读取受限 INTERVAL 声明目录。
+         * Returns: 目录结果。
+         */
+        private ResultSet catalogRows(String table, boolean intervalDictionary) {
+            List<Column> candidates = catalogDefinitions.containsKey(table)
+                ? catalogDefinitions.get(table) : Collections.emptyList();
+            final List<Column> columns = new ArrayList<>();
+            for (Column column : candidates) {
+                if (!intervalDictionary || column.nativeType != null
+                    && column.nativeType.startsWith(INTERVAL_DECLARATION_PREFIX)) {
+                    columns.add(column);
+                }
+            }
+            final int[] index = {-1};
+            final boolean[] lastNull = {false};
+            return proxy(ResultSet.class, (object, method, arguments) -> {
+                switch (method.getName()) {
+                    case "next": return ++index[0] < columns.size();
+                    case "wasNull": return lastNull[0];
+                    case "getString":
+                    case "getLong":
+                    case "getInt":
+                        Object value = catalogValue(columns.get(index[0]), table, String.valueOf(arguments[0]),
+                            method.getReturnType() == String.class, intervalDictionary);
+                        lastNull[0] = value == null;
+                        switch (method.getName()) {
+                            case "getString": return value == null ? null : String.valueOf(value);
+                            case "getLong": return value == null ? 0L : ((Number)value).longValue();
+                            default: return value == null ? 0 : ((Number)value).intValue();
+                        }
+                    default: return defaultValue(method.getReturnType());
+                }
+            });
+        }
+
+        /**
+         * 按目录列名返回已登记的真实属性，保留完整原生类型的大小写和转义。
+         * Params: column 字段定义；table 物理表名；key 目录列名；textValue 是否按文本读取；intervalDictionary 真实声明目录。
+         * Returns: 原始字段属性。
+         */
+        private Object catalogValue(Column column, String table, String key, boolean textValue,
+            boolean intervalDictionary) {
+            switch (key) {
+                case "COLUMN_NAME": return column.name;
+                case "COLUMN_TYPE": return column.nativeType;
+                case "DATA_TYPE": return textValue ? intervalDictionary ? column.nativeType : column.typeName : column.jdbcType;
+                case "TYPE_NAME": return column.typeName;
+                case "IS_NULLABLE": return column.nullable == DatabaseMetaData.columnNoNulls ? "NO"
+                    : column.nullable == DatabaseMetaData.columnNullable ? "YES" : null;
+                case "NULLABLE": return column.nullable;
+                case "DATA_PRECISION": return intervalDictionary ? null : column.precision;
+                case "DATA_SCALE": return intervalDictionary ? null : column.scale;
+                case "COLUMN_SIZE":
+                case "CHARACTER_MAXIMUM_LENGTH":
+                case "NUMERIC_PRECISION": return column.precision;
+                case "DECIMAL_DIGITS":
+                case "NUMERIC_SCALE":
+                case "DATETIME_PRECISION": return column.scale;
+                case "TABLE_NAME": return table;
+                case "TABLE_SCHEM": return FIXTURE_SCHEMA;
+                case "TABLE_CAT": return FIXTURE_CATALOG;
+                default: return null;
+            }
         }
 
         /**
@@ -926,6 +1613,8 @@ public class ArchiveStructureValidationCheck {
         private final int scale;
         /** 可空状态。 */
         private final int nullable;
+        /** 字段目录中完整的原生定义，不等同于驱动投射的 typeName。 */
+        private final String nativeType;
 
         /**
          * 记录字段定义。
@@ -933,12 +1622,23 @@ public class ArchiveStructureValidationCheck {
          * Returns: 字段定义。
          */
         private Column(String name, int jdbcType, String typeName, int precision, int scale, int nullable) {
+            this(name, jdbcType, typeName, precision, scale, nullable, null);
+        }
+
+        /**
+         * 同时记录字段目录原文，保留 ENUM/SET 成员等不能从投射元数据推导的属性。
+         * Params: name 字段名；jdbcType/typeName 投射类型；precision/scale 精度；nullable 可空；nativeType 目录原文。
+         * Returns: 字段定义。
+         */
+        private Column(String name, int jdbcType, String typeName, int precision, int scale, int nullable,
+            String nativeType) {
             this.name = name;
             this.jdbcType = jdbcType;
             this.typeName = typeName;
             this.precision = precision;
             this.scale = scale;
             this.nullable = nullable;
+            this.nativeType = nativeType;
         }
     }
 }

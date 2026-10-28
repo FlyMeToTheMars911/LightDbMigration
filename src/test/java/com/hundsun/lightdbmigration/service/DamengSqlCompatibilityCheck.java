@@ -44,6 +44,10 @@ public class DamengSqlCompatibilityCheck {
     private static final int TWO_IDENTITY_SETTINGS = 2;
     private static final int ARCHIVE_TARGET_SWITCHES = 3;
     private static final int SINGLE_METADATA_QUERY = 1;
+    /** 达梦派生 NUMBER 查询未报告有效精度和小数位时的元数据标记。 */
+    private static final int DM_UNSPECIFIED_PRECISION = 0;
+    private static final int DM_UNSPECIFIED_SCALE = -127;
+    private static final String DM_NUMBER_TYPE = "NUMBER";
     private static final String PHYSICAL_TABLE_METADATA_SQL = "SELECT * FROM \"APP\".\"PARENT_H\" WHERE 1 = 0";
     private static final String INTEGRITY_STATE = "23000";
     private static final String CURRENT_SCHEMA = "ARCHIVE_DATA";
@@ -69,6 +73,7 @@ public class DamengSqlCompatibilityCheck {
         verifyBatchFallback(MigrationConstants.INSERT_STRICT, DUPLICATE_KEY_CODE, false, true);
         verifyArchiveIdentitySwitches();
         verifyDerivedNullability();
+        verifyDerivedNumberMetadata();
         System.out.println("[RESULT] DAMENG_SQL_COMPATIBILITY_CHECK_PASSED");
     }
 
@@ -429,6 +434,41 @@ public class DamengSqlCompatibilityCheck {
         for (Object changed : incompatible) {
             require(rejects(queryValidation, archive, Collections.singletonList(changed), physicalColumns,
                 "DM", MigrationConstants.DB_DM), "DM must still reject changed type/precision/scale");
+        }
+    }
+
+    /**
+     * 验证现场达梦查询 NUMBER(0,-127) 不被当作源物理字段的精度变化。
+     * Params: 无。
+     * Returns: 无；已知精度差异和物理表差异仍必须拒绝。
+     */
+    private static void verifyDerivedNumberMetadata() throws Exception {
+        ArchiveEngine archive = new ArchiveEngine();
+        Class<?> columnClass = Class.forName(ArchiveEngine.class.getName() + "$ColumnMeta");
+        Constructor<?> constructor = columnClass.getDeclaredConstructor(String.class, int.class, String.class,
+            int.class, int.class, int.class);
+        constructor.setAccessible(true);
+        Method queryValidation = method(ArchiveEngine.class, "validateQueryCoversSourceTable", List.class,
+            List.class, String.class, String.class);
+        Method physicalValidation = method(ArchiveEngine.class, "validateSameStructure", List.class,
+            List.class, String.class);
+        int[][] definitions = {{20, 0}, {14, 0}, {8, 0}, {12, 4}};
+        for (int[] definition : definitions) {
+            Object physical = constructor.newInstance(FIELD_NAME, Types.NUMERIC, DM_NUMBER_TYPE,
+                definition[0], definition[1], DatabaseMetaData.columnNoNulls);
+            Object query = constructor.newInstance(FIELD_NAME, Types.NUMERIC, DM_NUMBER_TYPE,
+                DM_UNSPECIFIED_PRECISION, DM_UNSPECIFIED_SCALE, DatabaseMetaData.columnNullable);
+            List<Object> physicalColumns = Collections.singletonList(physical);
+            queryValidation.invoke(archive, Collections.singletonList(query), physicalColumns,
+                "DM", MigrationConstants.DB_DM);
+            Object changed = constructor.newInstance(FIELD_NAME, Types.NUMERIC, DM_NUMBER_TYPE,
+                definition[0] + 1, definition[1], DatabaseMetaData.columnNullable);
+            require(rejects(queryValidation, archive, Collections.singletonList(changed), physicalColumns,
+                "DM", MigrationConstants.DB_DM), "DM known NUMBER precision must remain strict");
+            require(rejects(physicalValidation, archive, Collections.singletonList(changed), physicalColumns,
+                "DM"), "DM physical NUMBER precision and nullability must remain exact");
+            require(rejects(queryValidation, archive, Collections.singletonList(query), physicalColumns,
+                "MySQL", MigrationConstants.DB_MYSQL), "MySQL must not inherit DM NUMBER sentinel compatibility");
         }
     }
 

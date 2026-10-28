@@ -46,13 +46,19 @@ public final class StructureSyncMysqlIntegrationCheck {
     private static final String STATUS_SUCCESS = "SUCCEEDED";
     private static final String STATUS_FAILED = "FAILED";
     private static final String METHOD_EXECUTE = "execute";
+    private static final String METHOD_GET_METADATA = "getMetaData";
     private static final String METHOD_CLOSE = "close";
     private static final String METHOD_COMMIT = "commit";
     private static final String METHOD_ROLLBACK = "rollback";
     private static final String METHOD_AUTOCOMMIT = "setAutoCommit";
+    private static final String METHOD_SET_PREFIX = "set";
+    private static final String METHOD_SET_NULL = "setNull";
+    private static final int BIND_ARGUMENT_COUNT = 2;
     private static final String DATA_SOURCE_SUFFIX = "S";
     private static final String DATA_TARGET_SUFFIX = "T";
     private static final int FULL_ALIGNMENT_STATEMENTS = 10;
+    /** 完整原生类型用例的真实字段定义差异条数；无参数 TEXT 的派生容量差异不计入。 */
+    private static final int COMPLETE_NATIVE_STATEMENTS = 5;
     private final String prefix = "LDM_SE_" + Long.toHexString(System.currentTimeMillis()).toUpperCase(Locale.ROOT);
     private final List<String> ownedTables = new ArrayList<>();
     private final List<String> sqlRecord = new ArrayList<>();
@@ -90,16 +96,56 @@ public final class StructureSyncMysqlIntegrationCheck {
             verifySuccess(true);
             verifyFullFieldAlignment(false);
             verifyFullFieldAlignment(true);
+            verifyCompleteNativeTypes(false);
+            verifyCompleteNativeTypes(true);
             verifyPartialFailure();
             assertions.add("迁移、归档确认执行及部分失败后的重复拒绝全部通过；源业务数据未自动迁移或删除。");
         } catch (Throwable exception) {
             failure = exception;
+            assertions.add("本轮未完成全部检查：" + (exception instanceof AssertionError
+                ? String.valueOf(exception.getMessage()) : exception.getClass().getSimpleName())
+                + "；已进入隔离对象清理流程。");
             throw exception;
         } finally {
             cleanup(physical, failure);
             config.clearPassword();
         }
         System.out.println("[RESULT] STRUCTURE_SYNC_MYSQL_INTEGRATION_CHECK_PASSED");
+    }
+
+    /** Params: archive 归档或迁移模式。 Returns: 无；完整枚举、浮点及数值修饰均能生成并执行对齐DDL。 */
+    private void verifyCompleteNativeTypes(boolean archive) throws Exception {
+        String mode = archive ? "NA" : "NM";
+        String source = prefix + "_" + mode + DATA_SOURCE_SUFFIX;
+        String target = prefix + "_" + mode + DATA_TARGET_SUFFIX;
+        create(source, "ID INT NOT NULL PRIMARY KEY, CHOICE ENUM('a','b','c') NULL,"
+            + " TAGS SET('x','y') NOT NULL, MEASURE FLOAT(10,2) NULL,"
+            + " PADDING_COUNT INT(10) UNSIGNED ZEROFILL NULL, PADDING_AMOUNT DECIMAL(8,2) UNSIGNED ZEROFILL NULL,"
+            + " NOTES TEXT CHARACTER SET utf8mb4 NULL");
+        create(target, "ID INT NOT NULL PRIMARY KEY, CHOICE ENUM('a','b','d') NULL,"
+            + " TAGS SET('x','z') NOT NULL, MEASURE FLOAT NULL,"
+            + " PADDING_COUNT INT(10) UNSIGNED NULL, PADDING_AMOUNT DECIMAL(8,2) UNSIGNED NULL,"
+            + " NOTES TEXT CHARACTER SET latin1 NULL");
+        update("INSERT INTO " + source + " VALUES (1,'b','y',1.25,12,3.45,'ascii')");
+        MigrationTask task = failedTask(source, target, archive);
+        List<String> statements = StructureSyncScript.parseStatements(task.getStructureSyncScript());
+        check(statements.size() == COMPLETE_NATIVE_STATEMENTS,
+            "五项真实原生差异均有DDL，相同TEXT声明不能因字符集派生容量不同误拦截");
+        for (String field : Arrays.asList("CHOICE", "TAGS", "MEASURE", "PADDING_COUNT", "PADDING_AMOUNT")) {
+            check(statements.stream().anyMatch(sql -> sql.startsWith(SQL_ALTER) && sql.contains("`" + field + "`")),
+                "枚举成员、浮点精度或数值修饰差异有可执行ALTER：" + field);
+        }
+        service().execute(task, syncRequest(task));
+        check(STATUS_SUCCESS.equals(execution(task).get("status")), "完整原生类型同步执行成功");
+        check(columnDefinitions(source).equals(columnDefinitions(target)),
+            "执行后ENUM/SET成员大小写与顺序、FLOAT(M,D)、UNSIGNED ZEROFILL及可空性均一致");
+        verifyRecheckPasses(task.getRequest(), archive);
+        check(count("SELECT COUNT(*) FROM " + source) == 1L
+            && count("SELECT COUNT(*) FROM " + target) == 0L, "原生字段对齐不执行业务数据任务");
+        assertions.add((archive ? "归档" : "迁移")
+            + "完整原生类型：ENUM/SET成员、FLOAT(10,2)、整数和定点数UNSIGNED ZEROFILL五项差异均有ALTER，执行后COLUMN_TYPE/IS_NULLABLE"
+            + "与源一致并重新预检通过；同为TEXT但字符集派生容量不同不产生无效ALTER。");
+        System.out.println("[CHECK] " + mode + "_COMPLETE_NATIVE_DEFINITIONS_PASSED");
     }
 
     /** Params: archive 归档或迁移模式。 Returns: 无；全部真实字段差异均有ALTER，执行后字段定义完全一致。 */
@@ -396,12 +442,20 @@ public final class StructureSyncMysqlIntegrationCheck {
 
     /** Params: delegate JDBC 语句；sql 预编译 SQL。 Returns: 记录所有实际执行 SQL 的代理。 */
     private Statement traceStatement(Statement delegate, String sql) {
+        Map<Integer, Object> parameters = new LinkedHashMap<>();
         Class<?> type = delegate instanceof PreparedStatement ? PreparedStatement.class : Statement.class;
         return (Statement)Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[]{type},
             (proxy, method, args) -> {
+                if (METHOD_GET_METADATA.equals(method.getName())) {
+                    sqlRecord.add("-- JDBC PreparedStatement.getMetaData; sql=" + sql);
+                }
+                if (method.getName().startsWith(METHOD_SET_PREFIX) && args != null && args.length >= BIND_ARGUMENT_COUNT
+                    && args[0] instanceof Integer) {
+                    parameters.put((Integer)args[0], METHOD_SET_NULL.equals(method.getName()) ? null : args[1]);
+                }
                 if (method.getName().startsWith(METHOD_EXECUTE)) {
                     String actual = sql == null ? (String)args[0] : sql;
-                    sqlRecord.add(actual + ";");
+                    sqlRecord.add(actual + ";" + (parameters.isEmpty() ? "" : " -- bind=" + parameters));
                     executedStatements++;
                 }
                 return invoke(method, delegate, args == null ? new Object[0] : args);
@@ -447,7 +501,7 @@ public final class StructureSyncMysqlIntegrationCheck {
                 .append("。单次真实登录，关闭自动重连；前缀：`").append(prefix)
                 .append("`。服务的连接开器注入唯一真实连接的记录代理，公开校验/执行路径不替换。\n\n")
                 .append("记录全部应用侧 SQL 和元数据 API；驱动内部登录初始化与元数据内部 SQL 无法获得原文。")
-                .append("本轮预检和DDL不使用绑定参数，不记录连接凭据。\n\n");
+                .append("完整物理列定义查询使用绑定参数，已随SQL记录；不记录连接凭据。\n\n");
             for (String result : assertions) {
                 record.append("- ").append(result).append('\n');
             }

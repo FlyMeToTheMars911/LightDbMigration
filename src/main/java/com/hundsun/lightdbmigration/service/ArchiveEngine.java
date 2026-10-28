@@ -44,6 +44,8 @@ public class ArchiveEngine {
     private static final int SINGLE_COLUMN_KEY_SIZE = 1;
     private static final int MAX_SQL_LOG_PARAMETERS = 50;
     private static final int MAX_SQL_LOG_VALUE_LENGTH = 160;
+    /** 无法确定物理字段精度时的边界。 */
+    private static final int UNKNOWN_PRECISION = 0;
 
     public void execute(MigrationTask task) {
         Connection connection = null;
@@ -95,7 +97,8 @@ public class ArchiveEngine {
     }
 
     private PreparedArchive prepare(MigrationTask task, Connection connection, String databaseType) throws Exception {
-        new ArchiveStructureValidator().validate(task, connection, databaseType);
+        ArchiveStructureValidator structureValidator = new ArchiveStructureValidator();
+        structureValidator.validate(task, connection, databaseType);
         ArchiveRequest archiveRequest = task.getRequest().getArchive();
         List<PreparedArchiveTable> mainTables = new ArrayList<>();
         List<PreparedArchiveTable> childTables = new ArrayList<>();
@@ -105,7 +108,8 @@ public class ArchiveEngine {
             task.setStepStatus(i, STEP_VALIDATING);
             task.markValidating("正在校验主业务表归档配置：" + mainRequest.getName());
             String mainSql = SqlSupport.normalizeSourceQuery(mainRequest.getSourceSql());
-            PreparedArchiveTable mainTable = prepareTable(task, connection, mainRequest, i, mainSql, databaseType);
+            PreparedArchiveTable mainTable = prepareTable(task, connection, mainRequest, i, mainSql, databaseType,
+                structureValidator);
             mainTables.add(mainTable);
             preparedByNodeId.put(mainRequest.getNodeId(), mainTable);
         }
@@ -123,7 +127,7 @@ public class ArchiveEngine {
             }
             String childSql = buildAllRelatedChildrenSql(childRequest, parentTable.sourceSql, databaseType);
             PreparedArchiveTable childTable = prepareTable(task, connection, childRequest, stepIndex, childSql,
-                databaseType);
+                databaseType, structureValidator);
             childTable.parentRelationIndexes = resolveParentRelationIndexes(childRequest, parentTable.columns);
             childTables.add(childTable);
             preparedByNodeId.put(childRequest.getNodeId(), childTable);
@@ -148,7 +152,7 @@ public class ArchiveEngine {
     }
 
     private PreparedArchiveTable prepareTable(MigrationTask task, Connection connection, ArchiveTableRequest request,
-        int index, String sourceSql, String databaseType) throws Exception {
+        int index, String sourceSql, String databaseType, ArchiveStructureValidator structureValidator) throws Exception {
         QualifiedName sourceName = SqlSupport.parseTableName(request.getSourceTable(), request.getName() + "源表");
         QualifiedName targetName = SqlSupport.parseTableName(request.getTargetTable(), request.getName() + "归档表");
         String sourceIdentity = canonicalTableIdentity(connection, sourceName, databaseType);
@@ -156,13 +160,15 @@ public class ArchiveEngine {
         if (sourceIdentity.equals(targetIdentity)) {
             throw new IllegalArgumentException(request.getName() + "的源表与归档表解析为同一个物理表，禁止归档");
         }
-        List<ColumnMeta> sourceTableColumns = readTableColumns(task, connection, sourceName, databaseType);
-        List<ColumnMeta> targetTableColumns = readTableColumns(task, connection, targetName, databaseType);
+        List<ColumnMeta> sourceTableColumns = readTableColumns(task, connection, sourceName, databaseType,
+            structureValidator);
+        List<ColumnMeta> targetTableColumns = readTableColumns(task, connection, targetName, databaseType,
+            structureValidator);
         List<ColumnMeta> queryColumns = readQueryColumns(task, connection, sourceSql);
         validateUniqueColumnNames(sourceTableColumns, request.getName() + "源表");
         validateUniqueColumnNames(targetTableColumns, request.getName() + "归档表");
         validateUniqueColumnNames(queryColumns, request.getName() + "归档查询");
-        validateSameStructure(sourceTableColumns, targetTableColumns, request.getName());
+        validateSameStructure(sourceTableColumns, targetTableColumns, request.getName(), databaseType);
         validateQueryCoversSourceTable(queryColumns, sourceTableColumns, request.getName(), databaseType);
         boolean keysetPagination = request.getCursorColumn() != null
             && !request.getCursorColumn().trim().isEmpty();
@@ -554,11 +560,48 @@ public class ArchiveEngine {
 
     private List<ColumnMeta> readTableColumns(MigrationTask task, Connection connection, QualifiedName tableName,
         String databaseType) throws Exception {
+        return readTableColumns(task, connection, tableName, databaseType, new ArchiveStructureValidator());
+    }
+
+    /**
+     * 使用本次 prepare 的列级定义缓存补齐物理字段，与前置预检保持一致。
+     * Params: task 当前任务；connection 当前连接；tableName 物理表；databaseType 方言；structureValidator 本次校验器。
+     * Returns: 最终归档准备使用的物理字段。
+     */
+    private List<ColumnMeta> readTableColumns(MigrationTask task, Connection connection, QualifiedName tableName,
+        String databaseType, ArchiveStructureValidator structureValidator) throws Exception {
         String sql = "SELECT * FROM " + quoteQualifiedName(tableName, databaseType) + " WHERE 1 = 0";
-        if (MigrationConstants.DB_DM.equals(databaseType) || MigrationConstants.DB_ORACLE.equals(databaseType)) {
-            return readColumnsForSql(task, connection, sql, MigrationConstants.DB_DM.equals(databaseType));
+        List<ColumnMeta> columns = readColumnsForSql(task, connection, sql, MigrationConstants.DB_DM.equals(databaseType));
+        boolean supplement = MigrationConstants.DB_MYSQL.equals(databaseType);
+        for (ColumnMeta column : columns) {
+            supplement |= ArchiveStructureValidator.needsPhysicalDefinition(databaseType, column.typeName,
+                column.precision, column.scale, column.nullable);
         }
-        return readQueryColumns(task, connection, sql);
+        if (!supplement) {
+            return columns;
+        }
+        Map<String, PhysicalColumnMetadataSupport.Definition> definitions =
+            structureValidator.readPhysicalDefinitions(task, connection, databaseType, tableName);
+        List<ColumnMeta> result = new ArrayList<>();
+        for (ColumnMeta column : columns) {
+            PhysicalColumnMetadataSupport.Definition definition = definitions.get(normalizeName(column.name));
+            if (definition == null) {
+                result.add(column);
+                continue;
+            }
+            result.add(new ColumnMeta(column.name,
+                ArchiveStructureValidator.missingJdbcType(column.jdbcType) && definition.jdbcType != null
+                    ? definition.jdbcType : column.jdbcType,
+                ArchiveStructureValidator.missingTypeName(column.typeName) && definition.typeName != null
+                    ? definition.typeName : column.typeName,
+                ArchiveStructureValidator.knownPhysicalPrecision(databaseType, column.typeName, column.precision, column.scale)
+                    || definition.precision == null ? column.precision : definition.precision,
+                ArchiveStructureValidator.knownPhysicalPrecision(databaseType, column.typeName, column.precision, column.scale)
+                    || definition.scale == null ? column.scale : definition.scale,
+                column.nullable != DatabaseMetaData.columnNullableUnknown ? column.nullable : definition.nullable,
+                column.autoIncrement, ArchiveStructureValidator.physicalNativeType(databaseType, definition)));
+        }
+        return result;
     }
 
     private List<String> resolveArchiveKeyColumns(MigrationTask task, Connection connection,
@@ -693,6 +736,15 @@ public class ArchiveEngine {
 
     private void validateSameStructure(List<ColumnMeta> sourceColumns, List<ColumnMeta> targetColumns,
         String displayName) {
+        validateSameStructure(sourceColumns, targetColumns, displayName, null);
+    }
+
+    /**
+     * Params: sourceColumns/targetColumns 两侧物理列；displayName 节点名；databaseType 方言。
+     * Returns: 无；仅忽略已确认原生类型相同的 MySQL 大字段换算容量，其余定义差异仍拒绝。
+     */
+    private void validateSameStructure(List<ColumnMeta> sourceColumns, List<ColumnMeta> targetColumns,
+        String displayName, String databaseType) {
         if (sourceColumns.size() != targetColumns.size()) {
             throw new IllegalArgumentException(displayName + "源表与归档表字段数量不同：源表 " + sourceColumns.size()
                 + " 个，归档表 " + targetColumns.size() + " 个");
@@ -703,7 +755,7 @@ public class ArchiveEngine {
             if (target == null) {
                 throw new IllegalArgumentException(displayName + "归档表缺少字段：" + source.name);
             }
-            if (!sameColumnDefinition(source, target)) {
+            if (!sameColumnDefinition(source, target, databaseType)) {
                 throw new IllegalArgumentException(displayName + "字段结构不同：" + source.name + "，源表="
                     + source.describe() + "，归档表=" + target.describe());
             }
@@ -744,7 +796,19 @@ public class ArchiveEngine {
     }
 
     private boolean sameColumnDefinition(ColumnMeta left, ColumnMeta right) {
-        return sameColumnTypeDefinition(left, right) && left.nullable == right.nullable;
+        return sameColumnDefinition(left, right, null);
+    }
+
+    /**
+     * Params: left/right 两侧物理列；databaseType 方言。
+     * Returns: 完整物理字段定义是否一致。
+     */
+    private boolean sameColumnDefinition(ColumnMeta left, ColumnMeta right, String databaseType) {
+        return left.jdbcType == right.jdbcType && normalizeName(left.typeName).equals(normalizeName(right.typeName))
+            && ArchiveStructureValidator.samePhysicalPrecision(databaseType, left.precision, right.precision,
+                left.nativeType, right.nativeType)
+            && left.scale == right.scale && left.nullable == right.nullable
+            && ArchiveStructureValidator.sameNativeDefinition(left.nativeType, right.nativeType);
     }
 
     /**
@@ -1224,6 +1288,8 @@ public class ArchiveEngine {
         private final int scale;
         private final int nullable;
         private final boolean autoIncrement;
+        /** 完整物理原生类型，仅用于物理表比较及建议定义。 */
+        private final String nativeType;
 
         private ColumnMeta(String name, int jdbcType, String typeName, int precision, int scale, int nullable) {
             this(name, jdbcType, typeName, precision, scale, nullable, false);
@@ -1236,6 +1302,16 @@ public class ArchiveEngine {
          */
         private ColumnMeta(String name, int jdbcType, String typeName, int precision, int scale, int nullable,
             boolean autoIncrement) {
+            this(name, jdbcType, typeName, precision, scale, nullable, autoIncrement, null);
+        }
+
+        /**
+         * Params: name 字段名；jdbcType/typeName 类型；precision/scale 精度；nullable 可空标志；
+         * autoIncrement 自增标志；nativeType 完整物理类型。
+         * Returns: 最终物理字段定义。
+         */
+        private ColumnMeta(String name, int jdbcType, String typeName, int precision, int scale, int nullable,
+            boolean autoIncrement, String nativeType) {
             this.name = name;
             this.jdbcType = jdbcType;
             this.typeName = typeName;
@@ -1243,10 +1319,12 @@ public class ArchiveEngine {
             this.scale = scale;
             this.nullable = nullable;
             this.autoIncrement = autoIncrement;
+            this.nativeType = nativeType;
         }
 
         private String describe() {
-            return typeName + "(" + precision + "," + scale + "),jdbcType=" + jdbcType + ",nullable=" + nullable;
+            return typeName + "(" + precision + "," + scale + "),jdbcType=" + jdbcType + ",nullable=" + nullable
+                + (nativeType == null ? "" : ",nativeType=" + nativeType);
         }
     }
 

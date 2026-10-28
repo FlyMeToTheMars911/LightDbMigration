@@ -15,6 +15,7 @@ import java.sql.SQLException;
 import java.sql.SQLNonTransientConnectionException;
 import java.sql.SQLRecoverableException;
 import java.sql.SQLTransientConnectionException;
+import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -58,6 +59,15 @@ final class ArchiveStructureValidator {
     private static final String LINE_BREAK = "\n";
     /** MySQL 无符号类型后缀。 */
     private static final String UNSIGNED_SUFFIX = " UNSIGNED";
+    /** MySQL 数值列完整定义中的补零显示修饰。 */
+    private static final String ZEROFILL_SUFFIX = " ZEROFILL";
+    /** MySQL 允许保留 UNSIGNED/ZEROFILL 修饰的数值类型。 */
+    private static final Set<String> MYSQL_MODIFIABLE_NUMERIC_TYPES = new LinkedHashSet<>(Arrays.asList(
+        "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT", "FLOAT", "REAL", "DOUBLE",
+        "DOUBLE PRECISION", "DEC", "DECIMAL", "NUMERIC"));
+    /** 无声明长度参数的 MySQL 大字段类型，其 JDBC 容量可能按字符集换算。 */
+    private static final Set<String> MYSQL_DERIVED_CAPACITY_TYPES = new LinkedHashSet<>(Arrays.asList(
+        "TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT", "TINYBLOB", "BLOB", "MEDIUMBLOB", "LONGBLOB"));
     /** 原样保留且无需追加长度的已知同库字段类型。 */
     private static final Set<String> SIMPLE_TYPES = new LinkedHashSet<>(Arrays.asList(
         "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT", "BIT", "BOOLEAN", "BOOL",
@@ -95,8 +105,40 @@ final class ArchiveStructureValidator {
         "ENUM", "SET", "UNKNOWN", "OTHER", "NULL"));
     /** 可以保留原生精度参数的浮点类型。 */
     private static final String FLOAT_TYPE = "FLOAT";
+    /** 可原样保留大小写和转义的完整 MySQL 枚举或集合类型。 */
+    private static final Pattern COMPLETE_ENUM_SET = Pattern.compile(
+        "(?is)(?:ENUM|SET)\\('(?:[^'\\\\]|\\\\.|'')*'(?:,\\s*'(?:[^'\\\\]|\\\\.|'')*')*\\)");
+    /** MySQL 浮点类型中未指定小数位的驱动标记。 */
+    private static final int MYSQL_UNKNOWN_FLOAT_SCALE = 31;
+    /** MySQL 已声明浮点小数位的上限。 */
+    private static final int MYSQL_MAX_FLOAT_SCALE = 30;
+    /** MySQL 浮点显示长度上限。 */
+    private static final int MYSQL_MAX_FLOAT_PRECISION = 255;
+    /** Oracle JDBC 年月间隔类型标记。 */
+    private static final String INTERVAL_YEAR_MONTH_TYPE = "INTERVALYM";
+    /** Oracle JDBC 日秒间隔类型标记。 */
+    private static final String INTERVAL_DAY_SECOND_TYPE = "INTERVALDS";
+    /** Oracle 年月间隔 SQL 类型名。 */
+    private static final String INTERVAL_YEAR_MONTH_SQL_TYPE = "INTERVAL YEAR TO MONTH";
+    /** Oracle 日秒间隔 SQL 类型名。 */
+    private static final String INTERVAL_DAY_SECOND_SQL_TYPE = "INTERVAL DAY TO SECOND";
+    /** 不能推断的间隔精度标记。 */
+    private static final int UNKNOWN_INTERVAL_PRECISION = -1;
+    /** Oracle 间隔类型前导字段及小数秒精度的最小值。 */
+    private static final int MIN_INTERVAL_PRECISION = 0;
+    /** Oracle 间隔类型前导字段及小数秒精度的最大值。 */
+    private static final int MAX_INTERVAL_PRECISION = 9;
+    /** 目录中已完整给出的年月间隔声明。 */
+    private static final Pattern INTERVAL_YEAR_MONTH_DECLARATION = Pattern.compile(
+        "INTERVAL YEAR\\(([0-9]+)\\) TO MONTH");
+    /** 目录中已完整给出的日秒间隔声明。 */
+    private static final Pattern INTERVAL_DAY_SECOND_DECLARATION = Pattern.compile(
+        "INTERVAL DAY\\(([0-9]+)\\) TO SECOND\\(([0-9]+)\\)");
     /** 禁止进入可执行建议的字段名控制字符。 */
     private static final String UNSAFE_FIELD_NAME_PATTERN = "(?s).*[\\p{Cc}\\p{Zl}\\p{Zp}].*";
+    /** 一次归档准备中每张物理表只补读一次列级定义，两阶段复用。 */
+    private final Map<String, Map<String, PhysicalColumnMetadataSupport.Definition>> physicalDefinitions =
+        new LinkedHashMap<>();
 
     /**
      * 独立遍历全部配置表；结构异常继续收集，控制请求和连接故障立即上抛。
@@ -104,6 +146,7 @@ final class ArchiveStructureValidator {
      * Returns: 无；发现任何问题时设置建议脚本并抛出汇总异常。
      */
     void validate(MigrationTask task, Connection connection, String databaseType) throws Exception {
+        physicalDefinitions.clear();
         ArchiveRequest archive = task.getRequest().getArchive();
         Set<String> issues = new LinkedHashSet<>();
         Set<String> statements = new LinkedHashSet<>();
@@ -157,8 +200,7 @@ final class ArchiveStructureValidator {
         List<Column> target = null;
         if (targetName != null) {
             try {
-                target = readColumns(task, connection, "SELECT * FROM " + quoteTable(targetName, databaseType)
-                    + " WHERE 1 = 0");
+                target = readPhysicalColumns(task, connection, targetName, databaseType);
             } catch (Exception exception) {
                 rethrowFatal(task, exception);
                 issues.add(label + "归档表 " + targetName.toSql() + " 无法读取字段：" + SqlSupport.safeMessage(exception));
@@ -183,7 +225,7 @@ final class ArchiveStructureValidator {
                     "SELECT * FROM (" + sql + ") LM_ARCHIVE_META WHERE 1 = 0");
                 uniqueColumns(query, label + "归档查询", issues);
                 if (source != null) {
-                    compareQuery(source, query, databaseType, label, issues);
+                    compareQuery(task, source, query, databaseType, label, issues);
                 }
             } catch (Exception exception) {
                 rethrowFatal(task, exception);
@@ -304,12 +346,127 @@ final class ArchiveStructureValidator {
             return null;
         }
         try {
-            return readColumns(task, connection, "SELECT * FROM " + quoteTable(name, databaseType) + " WHERE 1 = 0");
+            return readPhysicalColumns(task, connection, name, databaseType);
         } catch (Exception exception) {
             rethrowFatal(task, exception);
             issues.add(label + " " + name.toSql() + " 无法读取字段：" + SqlSupport.safeMessage(exception));
             return null;
         }
+    }
+
+    /**
+     * 读取物理列并按需补齐完整原生类型和可空属性，保留查询驱动的已知类型标记。
+     * Params: task 当前任务；connection 当前连接；name 物理表；databaseType 方言。
+     * Returns: 供物理结构比对和 DDL 生成使用的列。
+     */
+    private List<Column> readPhysicalColumns(MigrationTask task, Connection connection, QualifiedName name,
+        String databaseType) throws Exception {
+        List<Column> columns = readColumns(task, connection,
+            "SELECT * FROM " + quoteTable(name, databaseType) + " WHERE 1 = 0");
+        boolean supplement = MigrationConstants.DB_MYSQL.equals(databaseType);
+        for (Column column : columns) {
+            supplement |= needsPhysicalDefinition(databaseType, column.typeName, column.precision,
+                column.scale, column.nullable);
+        }
+        if (!supplement) {
+            return columns;
+        }
+        Map<String, PhysicalColumnMetadataSupport.Definition> definitions =
+            readPhysicalDefinitions(task, connection, databaseType, name);
+        List<Column> result = new ArrayList<>();
+        for (Column column : columns) {
+            PhysicalColumnMetadataSupport.Definition definition = definitions.get(normalize(column.name));
+            if (definition == null) {
+                result.add(column);
+                continue;
+            }
+            result.add(new Column(column.name,
+                missingJdbcType(column.jdbcType) && definition.jdbcType != null ? definition.jdbcType : column.jdbcType,
+                missingTypeName(column.typeName) && definition.typeName != null ? definition.typeName : column.typeName,
+                knownPhysicalPrecision(databaseType, column.typeName, column.precision, column.scale)
+                    || definition.precision == null ? column.precision : definition.precision,
+                knownPhysicalPrecision(databaseType, column.typeName, column.precision, column.scale)
+                    || definition.scale == null ? column.scale : definition.scale,
+                column.nullable != DatabaseMetaData.columnNullableUnknown ? column.nullable : definition.nullable,
+                physicalNativeType(databaseType, definition)));
+        }
+        return result;
+    }
+
+    /**
+     * 两阶段共享的按表缓存；普通补充读取失败记明原因并保留已经取得的字段元数据。
+     * Params: task 当前任务；connection 当前连接；databaseType 方言；name 物理表。
+     * Returns: 按大写字段名索引的补充定义。
+     */
+    Map<String, PhysicalColumnMetadataSupport.Definition> readPhysicalDefinitions(MigrationTask task,
+        Connection connection, String databaseType, QualifiedName name) throws Exception {
+        String key = databaseType + "." + normalize(name.toSql());
+        Map<String, PhysicalColumnMetadataSupport.Definition> cached = physicalDefinitions.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        Map<String, PhysicalColumnMetadataSupport.Definition> definitions;
+        try {
+            definitions = PhysicalColumnMetadataSupport.read(task, connection, databaseType, name);
+        } catch (Exception exception) {
+            rethrowFatal(task, exception);
+            task.warn("物理表 " + name.toSql() + " 的完整字段定义补充读取失败，将保留已读取元数据："
+                + SqlSupport.safeMessage(exception));
+            definitions = Collections.emptyMap();
+        }
+        physicalDefinitions.put(key, definitions);
+        return definitions;
+    }
+
+    /**
+     * Params: databaseType 方言；typeName 类型；precision/scale 精度；nullable 可空标记。
+     * Returns: 是否需要读取可靠物理定义。
+     */
+    static boolean needsPhysicalDefinition(String databaseType, String typeName, int precision, int scale,
+        int nullable) {
+        String type = typeName == null ? "" : typeName.trim().toUpperCase(Locale.ROOT);
+        return MigrationConstants.DB_MYSQL.equals(databaseType) || missingTypeName(type)
+            || nullable == DatabaseMetaData.columnNullableUnknown || FLOAT_TYPE.equals(type)
+            || type.startsWith("DOUBLE") || (LENGTH_TYPES.contains(type) && precision <= UNKNOWN_PRECISION)
+            || (DECIMAL_TYPES.contains(type) && precision <= UNKNOWN_PRECISION)
+            || (TIME_TYPES.contains(type) && scale < UNKNOWN_PRECISION)
+            || (MigrationConstants.DB_ORACLE.equals(databaseType) && intervalType(type));
+    }
+
+    /**
+     * Params: databaseType 方言；typeName 类型名；precision/scale 驱动精度。
+     * Returns: 是否保留当前驱动维度；Oracle INTERVAL 参数只采用目录原生声明，不替换为目录的字节长度。
+     */
+    static boolean knownPhysicalPrecision(String databaseType, String typeName, int precision, int scale) {
+        return precision > UNKNOWN_PRECISION || MigrationConstants.DB_ORACLE.equals(databaseType) && intervalType(typeName);
+    }
+
+    /**
+     * Params: databaseType 方言；definition 补充的物理目录定义。
+     * Returns: 完整原生声明；Oracle 间隔只采用目录已经明确写出的参数，不猜测默认值。
+     */
+    static String physicalNativeType(String databaseType, PhysicalColumnMetadataSupport.Definition definition) {
+        if (definition.nativeType != null) {
+            return definition.nativeType;
+        }
+        String type = definition.typeName == null ? "" : definition.typeName.trim().toUpperCase(Locale.ROOT);
+        if (MigrationConstants.DB_ORACLE.equals(databaseType)
+            && (INTERVAL_YEAR_MONTH_DECLARATION.matcher(type).matches()
+                || INTERVAL_DAY_SECOND_DECLARATION.matcher(type).matches())) {
+            return intervalTypeDefinition(type, UNKNOWN_INTERVAL_PRECISION, UNKNOWN_INTERVAL_PRECISION);
+        }
+        return null;
+    }
+
+    /** Params: typeName 类型名。 Returns: 类型名是否不足以判断字段定义。 */
+    static boolean missingTypeName(String typeName) {
+        return typeName == null || typeName.trim().isEmpty()
+            || INCOMPLETE_NATIVE_TYPES.contains(typeName.trim().toUpperCase(Locale.ROOT));
+    }
+
+    /** Params: jdbcType JDBC 类型。 Returns: 是否需要尝试补齐 JDBC 类型。 */
+    static boolean missingJdbcType(int jdbcType) {
+        return jdbcType == Types.NULL || jdbcType == Types.OTHER;
     }
 
     /**
@@ -359,7 +516,7 @@ final class ArchiveStructureValidator {
             if (targetColumn == null) {
                 issues.add(label + "归档表缺少字段：" + column.name);
                 addColumn(statements, targetName, column, null, databaseType);
-            } else if (!sameDefinition(column, targetColumn, true)) {
+            } else if (!sameDefinition(column, targetColumn, true, databaseType)) {
                 issues.add(label + "字段结构不同：" + column.name + "，源表=" + column.describe()
                     + "，归档表=" + targetColumn.describe());
                 addColumn(statements, targetName, column, targetColumn, databaseType);
@@ -381,10 +538,10 @@ final class ArchiveStructureValidator {
 
     /**
      * 汇总主表查询的字段覆盖问题，不将查询表达式当成源物理表生成改表脚本。
-     * Params: source/query 源物理表及查询字段；databaseType 方言；label 节点标签；issues 汇总问题。
+     * Params: task 当前任务；source/query 源物理表及查询字段；databaseType 方言；label 节点标签；issues 汇总问题。
      * Returns: 无。
      */
-    private void compareQuery(List<Column> source, List<Column> query, String databaseType,
+    private void compareQuery(MigrationTask task, List<Column> source, List<Column> query, String databaseType,
         String label, Set<String> issues) {
         Map<String, Column> sourceByName = index(source);
         Map<String, Column> queryByName = index(query);
@@ -396,6 +553,8 @@ final class ArchiveStructureValidator {
                 issues.add(label + "归档查询缺少源表字段：" + column.name);
             }
         }
+        boolean unknownPrecisionSeen = false;
+        int unknownPrecisionColumns = 0;
         for (Column column : queryByName.values()) {
             Column sourceColumn = sourceByName.get(normalize(column.name));
             if (sourceColumn == null) {
@@ -405,7 +564,16 @@ final class ArchiveStructureValidator {
                 sourceColumn.precision, sourceColumn.scale, sourceColumn.nullable)) {
                 issues.add(label + "归档查询字段类型与源表不同：" + column.name + "，查询="
                     + column.describe() + "，源表=" + sourceColumn.describe());
+            } else if (ArchiveQueryMetadataSupport.usesUnknownNumericPrecision(databaseType,
+                column.jdbcType, column.typeName, column.precision, column.scale,
+                sourceColumn.jdbcType, sourceColumn.typeName)) {
+                unknownPrecisionSeen = true;
+                unknownPrecisionColumns++;
             }
+        }
+        if (unknownPrecisionSeen) {
+            task.info(label + "已兼容 " + databaseType + " 归档查询数值字段的未知精度标记 (0,-127)，共 "
+                + unknownPrecisionColumns + " 列；查询字段类型已与源物理表核对，源表与归档表仍严格比对字段定义");
         }
     }
 
@@ -438,13 +606,47 @@ final class ArchiveStructureValidator {
 
     /**
      * 保持现有归档的严格字段定义判断。
-     * Params: left/right 两侧字段；compareNullable 是否比较可空性。
+     * Params: left/right 两侧字段；compareNullable 是否比较可空性；databaseType 方言。
      * Returns: JDBC 类型、数据库类型名、精度、小数位和可空性是否相同。
      */
-    private boolean sameDefinition(Column left, Column right, boolean compareNullable) {
+    private boolean sameDefinition(Column left, Column right, boolean compareNullable, String databaseType) {
         return left.jdbcType == right.jdbcType && normalize(left.typeName).equals(normalize(right.typeName))
-            && left.precision == right.precision && left.scale == right.scale
-            && (!compareNullable || left.nullable == right.nullable);
+            && samePhysicalPrecision(databaseType, left.precision, right.precision, left.nativeType, right.nativeType)
+            && left.scale == right.scale
+            && (!compareNullable || left.nullable == right.nullable)
+            && sameNativeDefinition(left.nativeType, right.nativeType);
+    }
+
+    /**
+     * 只在已确认 MySQL 无长度参数的原生类型相同时忽略 JDBC 换算容量差异。
+     * Params: databaseType 方言；left/right 两侧精度；leftNative/rightNative 完整原生类型。
+     * Returns: 声明精度是否相同，或是否仅为不应触发 DDL 的换算容量差异。
+     */
+    static boolean samePhysicalPrecision(String databaseType, int left, int right,
+        String leftNative, String rightNative) {
+        if (left == right) {
+            return true;
+        }
+        return MigrationConstants.DB_MYSQL.equals(databaseType) && leftNative != null && rightNative != null
+            && sameNativeDefinition(leftNative, rightNative)
+            && MYSQL_DERIVED_CAPACITY_TYPES.contains(leftNative.trim().toUpperCase(Locale.ROOT));
+    }
+
+    /**
+     * Params: left/right 完整物理原生类型。
+     * Returns: 原生类型是否相同；枚举成员保持大小写和转义。
+     */
+    static boolean sameNativeDefinition(String left, String right) {
+        if (left == null && right == null) {
+            return true;
+        }
+        if (left == null || right == null) {
+            return false;
+        }
+        if (COMPLETE_ENUM_SET.matcher(left.trim()).matches() || COMPLETE_ENUM_SET.matcher(right.trim()).matches()) {
+            return left.trim().equals(right.trim());
+        }
+        return left.trim().equalsIgnoreCase(right.trim());
     }
 
     /**
@@ -525,14 +727,29 @@ final class ArchiveStructureValidator {
      * Returns: 可还原的原生类型定义；缺枚举值或明确未知的类型返回 null。
      */
     private String typeDefinition(Column column, String databaseType) {
-        String type = normalize(column.typeName);
+        if (column.nativeType != null && COMPLETE_ENUM_SET.matcher(column.nativeType.trim()).matches()) {
+            return column.nativeType.trim();
+        }
+        String type = normalize(column.nativeType == null ? column.typeName : column.nativeType);
+        if (intervalType(type)) {
+            return MigrationConstants.DB_ORACLE.equals(databaseType)
+                ? intervalTypeDefinition(type, UNKNOWN_INTERVAL_PRECISION, UNKNOWN_INTERVAL_PRECISION) : null;
+        }
+        boolean zerofill = type.endsWith(ZEROFILL_SUFFIX);
+        if (zerofill) {
+            type = type.substring(0, type.length() - ZEROFILL_SUFFIX.length());
+        }
         boolean unsigned = type.endsWith(UNSIGNED_SUFFIX);
         if (unsigned) {
             type = type.substring(0, type.length() - UNSIGNED_SUFFIX.length());
         }
-        String suffix = unsigned ? UNSIGNED_SUFFIX : "";
+        String suffix = (unsigned ? UNSIGNED_SUFFIX : "") + (zerofill ? ZEROFILL_SUFFIX : "");
         int parameterIndex = type.indexOf('(');
         String baseType = parameterIndex < UNKNOWN_PRECISION ? type : type.substring(0, parameterIndex);
+        if (zerofill && (!MigrationConstants.DB_MYSQL.equals(databaseType)
+            || !MYSQL_MODIFIABLE_NUMERIC_TYPES.contains(baseType))) {
+            return null;
+        }
         if (INCOMPLETE_NATIVE_TYPES.contains(baseType)) {
             return null;
         }
@@ -572,7 +789,61 @@ final class ArchiveStructureValidator {
         if (BIT_TYPE.equals(type) && MigrationConstants.DB_MYSQL.equals(databaseType)) {
             return column.precision > UNKNOWN_PRECISION ? type + "(" + column.precision + ")" : null;
         }
+        if (FLOAT_TYPE.equals(type) && (MigrationConstants.DB_ORACLE.equals(databaseType)
+            || MigrationConstants.DB_DM.equals(databaseType))) {
+            return column.precision > UNKNOWN_PRECISION ? "FLOAT(" + column.precision + ")" : type;
+        }
+        if ((FLOAT_TYPE.equals(type) || type.startsWith("DOUBLE")) && MigrationConstants.DB_MYSQL.equals(databaseType)
+            && column.nativeType == null && column.precision > UNKNOWN_PRECISION
+            && column.precision <= MYSQL_MAX_FLOAT_PRECISION && column.scale > UNKNOWN_PRECISION
+            && column.scale <= MYSQL_MAX_FLOAT_SCALE && column.scale < MYSQL_UNKNOWN_FLOAT_SCALE
+            && column.scale <= column.precision) {
+            return type + "(" + column.precision + "," + column.scale + ")" + suffix;
+        }
         return SIMPLE_TYPES.contains(type) || SAFE_NATIVE_TYPE.matcher(type).matches() ? type + suffix : null;
+    }
+
+    /**
+     * 将 Oracle 驱动间隔类型名转换为合法 SQL；调用方须先确认 Oracle 方言。
+     * Params: typeName 驱动类型名或完整声明；precision 年/月或日的前导精度；scale 日秒类型的小数秒精度。
+     * Returns: 参数均明确且在 0..9 时的 SQL 声明；未知、越界或其他类型返回 null，不补默认 2/6。
+     */
+    static String intervalTypeDefinition(String typeName, int precision, int scale) {
+        String type = typeName == null ? "" : typeName.trim().toUpperCase(Locale.ROOT);
+        Matcher year = INTERVAL_YEAR_MONTH_DECLARATION.matcher(type);
+        Matcher day = INTERVAL_DAY_SECOND_DECLARATION.matcher(type);
+        try {
+            if (year.matches()) {
+                precision = Integer.parseInt(year.group(1));
+                type = INTERVAL_YEAR_MONTH_TYPE;
+            } else if (day.matches()) {
+                precision = Integer.parseInt(day.group(1));
+                scale = Integer.parseInt(day.group(2));
+                type = INTERVAL_DAY_SECOND_TYPE;
+            }
+        } catch (NumberFormatException exception) {
+            return null;
+        }
+        if (precision < MIN_INTERVAL_PRECISION || precision > MAX_INTERVAL_PRECISION) {
+            return null;
+        }
+        if (INTERVAL_YEAR_MONTH_TYPE.equals(type) || INTERVAL_YEAR_MONTH_SQL_TYPE.equals(type)) {
+            return "INTERVAL YEAR(" + precision + ") TO MONTH";
+        }
+        if ((INTERVAL_DAY_SECOND_TYPE.equals(type) || INTERVAL_DAY_SECOND_SQL_TYPE.equals(type))
+            && scale >= MIN_INTERVAL_PRECISION && scale <= MAX_INTERVAL_PRECISION) {
+            return "INTERVAL DAY(" + precision + ") TO SECOND(" + scale + ")";
+        }
+        return null;
+    }
+
+    /** Params: typeName 原生类型名。 Returns: 是否为当前明确支持的 Oracle 间隔类型表示。 */
+    private static boolean intervalType(String typeName) {
+        String type = typeName == null ? "" : typeName.trim().toUpperCase(Locale.ROOT);
+        return INTERVAL_YEAR_MONTH_TYPE.equals(type) || INTERVAL_DAY_SECOND_TYPE.equals(type)
+            || INTERVAL_YEAR_MONTH_SQL_TYPE.equals(type) || INTERVAL_DAY_SECOND_SQL_TYPE.equals(type)
+            || INTERVAL_YEAR_MONTH_DECLARATION.matcher(type).matches()
+            || INTERVAL_DAY_SECOND_DECLARATION.matcher(type).matches();
     }
 
     /**
@@ -738,18 +1009,30 @@ final class ArchiveStructureValidator {
         private final int scale;
         /** JDBC 可空标志。 */
         private final int nullable;
+        /** 补充取得的完整物理原生类型，保留 ENUM/SET 成员及转义。 */
+        private final String nativeType;
 
         /**
          * Params: name 字段名；jdbcType/typeName 类型；precision/scale 精度；nullable 可空标志。
          * Returns: 字段定义。
          */
         private Column(String name, int jdbcType, String typeName, int precision, int scale, int nullable) {
+            this(name, jdbcType, typeName, precision, scale, nullable, null);
+        }
+
+        /**
+         * Params: name 字段名；jdbcType/typeName 类型；precision/scale 精度；nullable 可空标志；nativeType 完整原生类型。
+         * Returns: 物理字段定义。
+         */
+        private Column(String name, int jdbcType, String typeName, int precision, int scale, int nullable,
+            String nativeType) {
             this.name = name;
             this.jdbcType = jdbcType;
             this.typeName = typeName;
             this.precision = precision;
             this.scale = scale;
             this.nullable = nullable;
+            this.nativeType = nativeType;
         }
 
         /**
@@ -757,7 +1040,8 @@ final class ArchiveStructureValidator {
          * Returns: 日志和脚本说明使用的字段定义。
          */
         private String describe() {
-            return typeName + "(" + precision + "," + scale + "),jdbcType=" + jdbcType + ",nullable=" + nullable;
+            return typeName + "(" + precision + "," + scale + "),jdbcType=" + jdbcType + ",nullable=" + nullable
+                + (nativeType == null ? "" : ",nativeType=" + nativeType);
         }
     }
 }

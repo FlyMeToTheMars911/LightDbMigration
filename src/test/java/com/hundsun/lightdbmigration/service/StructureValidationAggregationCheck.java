@@ -51,6 +51,7 @@ public class StructureValidationAggregationCheck {
     private static final int FIRST_NUMERIC_MINIMUM_INDEX = 2;
     private static final int SECOND_NUMERIC_MINIMUM_INDEX = 4;
     private static final String JDBC_PREPARE_STATEMENT = "prepareStatement";
+    private static final String MYSQL_COLUMN_CATALOG = "information_schema.COLUMNS";
 
     private final AtomicInteger sourceMetadataQueries = new AtomicInteger();
     private final AtomicInteger targetMetadataQueries = new AtomicInteger();
@@ -141,6 +142,9 @@ public class StructureValidationAggregationCheck {
         verifyBooleanMappingRoundTrip(engine);
         verifyLobMappingRoundTrip(engine);
         verifyUnspecifiedFloatingScaleRoundTrip(engine);
+        verifyCreateOrderIndependentSignature(engine);
+        verifyPhysicalDefinitionSupplements(engine);
+        verifyOriginalPreparedQueryMetadata(engine);
     }
 
     private void verifyDefaultNamespaceAliases(MigrationEngine engine) throws Exception {
@@ -166,6 +170,9 @@ public class StructureValidationAggregationCheck {
         Object column = columnMeta(TARGET_ONE, Types.VARCHAR, "VARCHAR", 20);
         addColumn.invoke(engine, statements, unqualified, column, MigrationConstants.DB_MYSQL);
         addColumn.invoke(engine, statements, qualified, column, MigrationConstants.DB_MYSQL);
+        addColumn.invoke(engine, statements, qualified,
+            columnMeta(TARGET_ONE.toLowerCase(java.util.Locale.ROOT), Types.VARCHAR, "VARCHAR", 20),
+            MigrationConstants.DB_MYSQL);
         assertEquals(1, statements.size(), "默认模式别名下相同 DDL 未去重");
         assertContains(statements.iterator().next(), "ALTER TABLE `" + TARGET_ONE + "` ADD COLUMN `" + TARGET_ONE + "`",
             "归一化冲突键改变了实际输出的表名或同名字段引用");
@@ -188,6 +195,132 @@ public class StructureValidationAggregationCheck {
         for (String statement : ambiguous) {
             assertNoExecutableLine(statement, "ALTER TABLE", "默认库不可读取时仍输出歧义目标的可执行建议");
         }
+    }
+
+    private void verifyCreateOrderIndependentSignature(MigrationEngine engine) throws Exception {
+        Class<?> statementsClass = Class.forName(MigrationEngine.class.getName() + "$StructureStatements");
+        Constructor<?> constructor = statementsClass.getDeclaredConstructor();
+        constructor.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Set<String> statements = (Set<String>)constructor.newInstance();
+        Method create = MigrationEngine.class.getDeclaredMethod("addCreateTableStatement", Set.class,
+            QualifiedName.class, List.class, String.class);
+        create.setAccessible(true);
+        QualifiedName table = SqlSupport.parseTargetTable(TARGET_ONE);
+        create.invoke(engine, statements, table, Arrays.asList(
+            columnMeta("NAME", Types.VARCHAR, "VARCHAR", 40), columnMeta("ID", Types.INTEGER, "INT", 10)),
+            MigrationConstants.DB_MYSQL);
+        create.invoke(engine, statements, table, Arrays.asList(
+            columnMeta("id", Types.INTEGER, "INT", 10), columnMeta("name", Types.VARCHAR, "VARCHAR", 40)),
+            MigrationConstants.DB_MYSQL);
+        assertEquals(1, statements.size(), "同字段定义仅顺序或大小写不同的 CREATE 被误判冲突");
+        String first = statements.iterator().next();
+        if (first.indexOf("`NAME`") >= first.indexOf("`ID`")) {
+            throw new AssertionError("CREATE 语义去重改变了首次输出的列顺序");
+        }
+        create.invoke(engine, statements, table, Arrays.asList(
+            columnMeta("ID", Types.INTEGER, "INT", 10), columnMeta("NAME", Types.VARCHAR, "VARCHAR", 80)),
+            MigrationConstants.DB_MYSQL);
+        assertContains(statements.toString(), "存在冲突的结构建议", "真正不同的 CREATE 定义没有检测冲突");
+        for (String statement : statements) {
+            assertNoExecutableLine(statement, "CREATE TABLE", "冲突 CREATE 仍可执行");
+        }
+    }
+
+    private void verifyPhysicalDefinitionSupplements(MigrationEngine engine) throws Exception {
+        Class<?> columnType = Class.forName(MigrationEngine.class.getName() + "$ColumnMeta");
+        Method supplement = MigrationEngine.class.getDeclaredMethod("supplementColumn", columnType,
+            PhysicalColumnMetadataSupport.Definition.class, String.class);
+        supplement.setAccessible(true);
+        Method typeDefinition = MigrationEngine.class.getDeclaredMethod("targetTypeDefinition", columnType, String.class);
+        typeDefinition.setAccessible(true);
+        Method nullability = MigrationEngine.class.getDeclaredMethod("sourceNullableClause", columnType);
+        nullability.setAccessible(true);
+        String nativeEnum = "enum('a','B','it\\'s','path\\\\x')";
+        Object enumerated = supplement.invoke(engine, columnMeta("FLAG", Types.CHAR, "CHAR", 6),
+            new PhysicalColumnMetadataSupport.Definition("FLAG", nativeEnum, "enum", null, 6, null,
+                DatabaseMetaData.columnNoNulls), MigrationConstants.DB_MYSQL);
+        assertContains(String.valueOf(typeDefinition.invoke(engine, enumerated, MigrationConstants.DB_MYSQL)),
+            "ENUM" + nativeEnum.substring(nativeEnum.indexOf('(')), "ENUM 成员大小写或转义被改写");
+        assertContains(String.valueOf(nullability.invoke(engine, enumerated)), " NULL",
+            "物理补读覆盖了已知查询可空性");
+        Object knownLength = supplement.invoke(engine,
+            columnMeta("NAME", Types.VARCHAR, "VARCHAR", 10, DatabaseMetaData.columnNullableUnknown),
+            new PhysicalColumnMetadataSupport.Definition("NAME", "varchar(80)", "varchar", null, 80, null,
+                DatabaseMetaData.columnNoNulls), MigrationConstants.DB_MYSQL);
+        assertContains(String.valueOf(typeDefinition.invoke(engine, knownLength, MigrationConstants.DB_MYSQL)),
+            "VARCHAR(10)", "补读覆盖了已知查询或表达式的长度定义");
+        assertContains(String.valueOf(nullability.invoke(engine, knownLength)), "NOT NULL", "源未知可空性未按物理来源补齐");
+        Constructor<?> columnConstructor = columnType.getDeclaredConstructor(String.class, int.class, String.class,
+            int.class, int.class, int.class, boolean.class);
+        columnConstructor.setAccessible(true);
+        Object unknownNumeric = columnConstructor.newInstance("AMOUNT", Types.NUMERIC, "NUMBER", 0, -127,
+            DatabaseMetaData.columnNullable, false);
+        Object resolved = supplement.invoke(engine, unknownNumeric,
+            new PhysicalColumnMetadataSupport.Definition("AMOUNT", null, "DECIMAL", Types.DECIMAL, 20, 2,
+                DatabaseMetaData.columnNoNulls), MigrationConstants.DB_DM);
+        assertContains(String.valueOf(typeDefinition.invoke(engine, resolved, MigrationConstants.DB_DM)),
+            "DECIMAL(20,2)", "达梦查询未知精度没有按明确物理字段补齐");
+        Object unbounded = supplement.invoke(engine, unknownNumeric,
+            new PhysicalColumnMetadataSupport.Definition("AMOUNT", null, "NUMBER", Types.NUMERIC, 0, -127,
+                DatabaseMetaData.columnNullable), MigrationConstants.DB_DM);
+        assertContains(String.valueOf(typeDefinition.invoke(engine, unbounded, MigrationConstants.DB_DM)),
+            "NUMBER", "物理原生无精度 NUMBER 没有保留完整语义");
+        Object unresolved = supplement.invoke(engine, unknownNumeric, null, MigrationConstants.DB_DM);
+        if (typeDefinition.invoke(engine, unresolved, MigrationConstants.DB_DM) != null) {
+            throw new AssertionError("没有物理来源时把达梦未知精度伪造为已知定义");
+        }
+    }
+
+    private void verifyOriginalPreparedQueryMetadata(MigrationEngine engine) throws Exception {
+        List<ColumnDef> physical = Arrays.asList(column("ACT_ID", Types.NUMERIC, "NUMBER", 20, 0,
+            DatabaseMetaData.columnNoNulls));
+        final String sourceSql = "SELECT ACT_ID AS ACT_ID FROM " + SOURCE_ONE;
+        AtomicInteger directDescriptions = new AtomicInteger();
+        AtomicInteger wrappedMetadataQueries = new AtomicInteger();
+        Connection source = proxy(Connection.class, (proxy, method, arguments) -> {
+            switch (method.getName()) {
+                case "prepareStatement":
+                    final String sql = String.valueOf(arguments[0]);
+                    return proxy(PreparedStatement.class, (statement, called, parameters) -> {
+                        switch (called.getName()) {
+                            case "getMetaData":
+                                if (sourceSql.equals(sql)) {
+                                    directDescriptions.incrementAndGet();
+                                    return resultSetMetaData(physical);
+                                }
+                                return null;
+                            case "executeQuery":
+                                if (sourceSql.equals(sql)) {
+                                    throw new AssertionError("元数据描述执行了原始查询数据行");
+                                }
+                                if (sql.contains("WHERE 1 = 0")) {
+                                    wrappedMetadataQueries.incrementAndGet();
+                                    return metadataResultSet(Arrays.asList(column("ACT_ID", Types.NUMERIC, "NUMBER", 0,
+                                        -127, DatabaseMetaData.columnNullable)));
+                                }
+                                return countResultSet();
+                            default:
+                                return defaultValue(called.getReturnType());
+                        }
+                    });
+                default:
+                    return defaultValue(method.getReturnType());
+            }
+        });
+        CreateTaskRequest request = new CreateTaskRequest();
+        request.setSource(databaseConfig());
+        request.setTarget(databaseConfig());
+        request.setSteps(Arrays.asList(step("原始达梦查询描述", sourceSql, TARGET_ONE, null)));
+        MigrationTask task = new MigrationTask("ORIGINAL-PREPARED-METADATA-CHECK", request);
+        Method prepare = MigrationEngine.class.getDeclaredMethod("prepareAllSteps", MigrationTask.class,
+            Connection.class, Connection.class, String.class, String.class);
+        prepare.setAccessible(true);
+        List<?> prepared = (List<?>)prepare.invoke(engine, task, source, definitionConnection(physical),
+            MigrationConstants.DB_DM, MigrationConstants.DB_DM);
+        assertEquals(1, prepared.size(), "原始预编译精度和非空标记未用于迁移预检");
+        assertEquals(1, directDescriptions.get(), "原始查询未只做一次预编译描述");
+        assertEquals(0, wrappedMetadataQueries.get(), "原始描述可用时仍采用丢失精度/非空性的包裹查询");
     }
 
     private void verifyAllFieldDefinitionDifferences(MigrationEngine engine) throws Exception {
@@ -411,7 +544,8 @@ public class StructureValidationAggregationCheck {
                     return proxy(PreparedStatement.class, (statement, called, parameters) -> {
                         switch (called.getName()) {
                             case "executeQuery":
-                                return sql.contains("WHERE 1 = 0") ? metadataResultSet(columns) : countResultSet();
+                                return sql.contains(MYSQL_COLUMN_CATALOG) ? emptyResultSet()
+                                    : sql.contains("WHERE 1 = 0") ? metadataResultSet(columns) : countResultSet();
                             default:
                                 return defaultValue(called.getReturnType());
                         }
@@ -822,6 +956,9 @@ public class StructureValidationAggregationCheck {
             public Object invoke(Object proxy, Method method, Object[] arguments) {
                 String name = method.getName();
                 if ("executeQuery".equals(name)) {
+                    if (sql.contains(MYSQL_COLUMN_CATALOG)) {
+                        return emptyResultSet();
+                    }
                     if (sql.contains("WHERE 1 = 0")) {
                         return metadataResultSet(Arrays.asList(
                             column(APPLICATION_CURSOR, Types.VARCHAR, "VARCHAR", 64),
@@ -910,6 +1047,9 @@ public class StructureValidationAggregationCheck {
             public Object invoke(Object proxy, Method method, Object[] arguments) {
                 String name = method.getName();
                 if ("executeQuery".equals(name)) {
+                    if (sql.contains(MYSQL_COLUMN_CATALOG)) {
+                        return emptyResultSet();
+                    }
                     if (sql.contains("WHERE 1 = 0")) {
                         if (source) {
                             sourceMetadataQueries.incrementAndGet();
