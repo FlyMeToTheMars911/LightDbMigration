@@ -8,6 +8,7 @@ import com.hundsun.lightdbmigration.model.MigrationStepRequest;
 import com.hundsun.lightdbmigration.model.StructureSyncRequest;
 import com.hundsun.lightdbmigration.support.DatabaseSupport;
 import com.hundsun.lightdbmigration.support.MigrationConstants;
+import com.hundsun.lightdbmigration.support.StructureSyncScript;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -28,6 +29,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 
@@ -48,6 +50,9 @@ public final class StructureSyncMysqlIntegrationCheck {
     private static final String METHOD_COMMIT = "commit";
     private static final String METHOD_ROLLBACK = "rollback";
     private static final String METHOD_AUTOCOMMIT = "setAutoCommit";
+    private static final String DATA_SOURCE_SUFFIX = "S";
+    private static final String DATA_TARGET_SUFFIX = "T";
+    private static final int FULL_ALIGNMENT_STATEMENTS = 10;
     private final String prefix = "LDM_SE_" + Long.toHexString(System.currentTimeMillis()).toUpperCase(Locale.ROOT);
     private final List<String> ownedTables = new ArrayList<>();
     private final List<String> sqlRecord = new ArrayList<>();
@@ -83,6 +88,8 @@ public final class StructureSyncMysqlIntegrationCheck {
                 + " AND TABLE_NAME LIKE '" + prefix + "_%'") == 0L, "隔离对象不得预先存在");
             verifySuccess(false);
             verifySuccess(true);
+            verifyFullFieldAlignment(false);
+            verifyFullFieldAlignment(true);
             verifyPartialFailure();
             assertions.add("迁移、归档确认执行及部分失败后的重复拒绝全部通过；源业务数据未自动迁移或删除。");
         } catch (Throwable exception) {
@@ -93,6 +100,71 @@ public final class StructureSyncMysqlIntegrationCheck {
             config.clearPassword();
         }
         System.out.println("[RESULT] STRUCTURE_SYNC_MYSQL_INTEGRATION_CHECK_PASSED");
+    }
+
+    /** Params: archive 归档或迁移模式。 Returns: 无；全部真实字段差异均有ALTER，执行后字段定义完全一致。 */
+    private void verifyFullFieldAlignment(boolean archive) throws Exception {
+        String mode = archive ? "FA" : "FM";
+        String source = prefix + "_" + mode + DATA_SOURCE_SUFFIX;
+        String target = prefix + "_" + mode + DATA_TARGET_SUFFIX;
+        create(source, "ID INT NOT NULL PRIMARY KEY, PROF_TYPE CHAR(1) NULL, TENANT_ID VARCHAR(32) NULL,"
+            + " USER_ID VARCHAR(100) NULL, REQUIRED_VALUE VARCHAR(20) NOT NULL, VALUE_TEXT VARCHAR(12) NULL,"
+            + " SCORE DECIMAL(8,2) NULL, TYPE_CHANGED VARCHAR(20) NULL, TO_ADD CHAR(2) NOT NULL, MEASURE FLOAT NULL");
+        create(target, "ID INT NOT NULL PRIMARY KEY, PROF_TYPE CHAR(1) NOT NULL, TENANT_ID VARCHAR(32) NOT NULL,"
+            + " USER_ID VARCHAR(100) NOT NULL, REQUIRED_VALUE VARCHAR(20) NULL, VALUE_TEXT VARCHAR(60) NULL,"
+            + " SCORE DECIMAL(12,4) NULL, TYPE_CHANGED INT NULL, EXTRA_COLUMN VARCHAR(10) NULL, MEASURE DOUBLE NULL");
+        update("INSERT INTO " + source + " VALUES (1,'A','tenant','user','required','short',12.30,'123','X',1.25)");
+        MigrationTask task = failedTask(source, target, archive);
+        List<String> statements = StructureSyncScript.parseStatements(task.getStructureSyncScript());
+        check(statements.size() == FULL_ALIGNMENT_STATEMENTS, "十项真实字段差异应对应十条ALTER");
+        for (String field : Arrays.asList("PROF_TYPE", "TENANT_ID", "USER_ID", "REQUIRED_VALUE",
+            "VALUE_TEXT", "SCORE", "TYPE_CHANGED", "TO_ADD", "EXTRA_COLUMN", "MEASURE")) {
+            check(statements.stream().anyMatch(sql -> sql.startsWith(SQL_ALTER) && sql.contains("`" + field + "`")),
+                "每一项字段差异都有可执行ALTER：" + field);
+        }
+        check(statements.stream().anyMatch(sql -> sql.contains("DROP COLUMN `EXTRA_COLUMN`")),
+            "目标多余字段有直接DROP COLUMN");
+        service().execute(task, syncRequest(task));
+        check(STATUS_SUCCESS.equals(execution(task).get("status")), "完整字段差异脚本执行成功");
+        check(number(execution(task).get("executedStatements")) == FULL_ALIGNMENT_STATEMENTS,
+            "完整字段差异脚本执行条数正确");
+        check(columnDefinitions(source).equals(columnDefinitions(target)),
+            "执行后目标字段集合、原生类型、长度精度和可空性与源完全相同");
+        verifyRecheckPasses(task.getRequest(), archive);
+        check(count("SELECT COUNT(*) FROM " + source) == 1L
+            && count("SELECT COUNT(*) FROM " + target) == 0L, "字段对齐不启动业务数据任务");
+        assertions.add((archive ? "归档" : "迁移")
+            + "完整对齐：CHAR/VARCHAR纯非空差异、NULL/NOT NULL双向、长度缩小、数字精度缩小、类型变更、"
+            + "FLOAT/DOUBLE差异、缺失字段和多余字段共十项均有直接ALTER；十条执行成功，"
+            + "源目标字段元数据逐项一致，重新预检通过。");
+        System.out.println("[CHECK] " + mode + "_ALL_TEN_FIELD_DIFFERENCES_ALIGNED_PASSED");
+    }
+
+    /** Params: table 隔离表名。 Returns: 不含历史数据的字段原生类型和可空性映射。 */
+    private Map<String, String> columnDefinitions(String table) throws Exception {
+        String sql = "SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE FROM information_schema.columns"
+            + " WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='" + table + "' ORDER BY ORDINAL_POSITION";
+        Map<String, String> definitions = new LinkedHashMap<>();
+        try (Statement statement = connection.createStatement(); ResultSet rows = statement.executeQuery(sql)) {
+            while (rows.next()) {
+                definitions.put(rows.getString(1), rows.getString(2) + ":" + rows.getString(3));
+            }
+        }
+        return definitions;
+    }
+
+    /** Params: request 已执行结构同步的任务配置；archive 归档或迁移模式。 Returns: 无；重新预检必须通过。 */
+    private void verifyRecheckPasses(CreateTaskRequest request, boolean archive) throws Exception {
+        MigrationTask task = new MigrationTask("recheck-" + request.getName(), request);
+        Object engine = archive ? new ArchiveEngine() : new MigrationEngine();
+        Method prepare = archive ? ArchiveEngine.class.getDeclaredMethod("prepare", MigrationTask.class,
+            Connection.class, String.class) : MigrationEngine.class.getDeclaredMethod("prepareAllSteps",
+            MigrationTask.class, Connection.class, Connection.class, String.class, String.class);
+        prepare.setAccessible(true);
+        Object prepared = archive ? invoke(prepare, engine, task, connection, MigrationConstants.DB_MYSQL)
+            : invoke(prepare, engine, task, connection, connection, MigrationConstants.DB_MYSQL,
+                MigrationConstants.DB_MYSQL);
+        check(prepared != null && task.getStructureSyncScript() == null, "全字段对齐后无残余结构问题");
     }
 
     /** Params: archive 是否归档。 Returns: 无；使用真实引擎预检生成脚本，再走公开执行服务。 */
@@ -371,7 +443,8 @@ public final class StructureSyncMysqlIntegrationCheck {
         }
         try {
             StringBuilder record = new StringBuilder("# 结构脚本确认执行 MySQL SQL 记录\n\n")
-                .append("日期：2026-10-26。单次真实登录，关闭自动重连；前缀：`").append(prefix)
+                .append("日期：").append(java.time.LocalDate.now(java.time.ZoneId.of("Asia/Shanghai")))
+                .append("。单次真实登录，关闭自动重连；前缀：`").append(prefix)
                 .append("`。服务的连接开器注入唯一真实连接的记录代理，公开校验/执行路径不替换。\n\n")
                 .append("记录全部应用侧 SQL 和元数据 API；驱动内部登录初始化与元数据内部 SQL 无法获得原文。")
                 .append("本轮预检和DDL不使用绑定参数，不记录连接凭据。\n\n");

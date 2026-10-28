@@ -55,7 +55,7 @@ public class ArchiveStructureValidationCheck {
     private static final String TIGHTEN_COLUMN = "TIGHTEN_VALUE";
     private static final String INTEGER_TYPE = "INT";
     private static final String TEXT_TYPE = "VARCHAR";
-    private static final String UNKNOWN_TYPE = "CUSTOM_UNSUPPORTED";
+    private static final String UNKNOWN_TYPE = "ENUM";
     private static final String MISSING_STATE = "42S02";
     private static final String CONNECTION_STATE = "08006";
     private static final int MISSING_CODE = 1146;
@@ -64,6 +64,13 @@ public class ArchiveStructureValidationCheck {
     private static final int EXPECTED_PHYSICAL_TABLES = 8;
     private static final int NO_WRITES = 0;
     private static final int FIRST_QUERY = 1;
+    private static final String BUSINESS_QUERY_MARKER = "BUSINESS_QUERY";
+    private static final String NUMBER_TYPE = "NUMBER";
+    private static final String ORACLE_TEXT_TYPE = "VARCHAR2";
+    private static final String COUNT_QUERY_PREFIX = "SELECT COUNT(*)";
+    private static final String DERIVED_QUERY_PREFIX = "FROM (";
+    private static final int EXPECTED_METADATA_PHASES = 2;
+    private static final long SINGLE_ROW = 1L;
 
     /**
      * 执行不依赖真实数据库的结构校验回归。
@@ -76,9 +83,13 @@ public class ArchiveStructureValidationCheck {
         verifyConnectionFailureStopsScanning();
         verifyStopAndInterruptionStopScanning();
         verifyUnknownTypeNeedsManualHandling();
-        verifyNullableSourceNeedsManualHandling();
+        verifyNullabilityChangesGenerateDdl();
         verifyOracleAndDmScripts();
         verifySharedTargetNeedsManualHandling();
+        verifyOracleUnknownQueryMetadataThroughPrepare();
+        verifyKnownQueryMetadataDifferencesRemainRejected();
+        verifyOracleUnknownQueryDoesNotHidePhysicalDifferences();
+        verifyNativeTypesProduceExecutableDdl();
         System.out.println("[RESULT] ARCHIVE_STRUCTURE_VALIDATION_CHECK_PASSED");
     }
 
@@ -114,11 +125,8 @@ public class ArchiveStructureValidationCheck {
             assertContains(script, expected, "汇总建议脚本遗漏 " + expected);
         }
         assertContains(script, "工具不会未经确认执行", "脚本缺少确认要求");
-        for (String line : script.split("\\r?\\n")) {
-            String statement = line.trim().toUpperCase(Locale.ROOT);
-            assertTrue(statement.startsWith("--") || !statement.matches(".*\\bDROP\\b.*"),
-                "多余字段不应生成直接执行的删除 DDL");
-        }
+        assertExecutableStatement(script, "ALTER TABLE `" + FIRST_TARGET + "` DROP COLUMN `"
+            + EXTRA_COLUMN + "`;", "目标多余字段未生成可执行 DROP COLUMN 建议");
         assertEquals(NO_WRITES, fixture.writes, "结构不通过时出现数据写入或删除");
     }
 
@@ -205,28 +213,42 @@ public class ArchiveStructureValidationCheck {
     }
 
     /**
-     * 源可空而目标非空时仍报告差异，但不能生成直接放宽目标约束的可执行 DDL。
+     * 三种数据库均按源定义生成可空性双向修改，覆盖单独约束差异和合并长度差异。
      * Params: 无。
      * Returns: 无。
      */
-    private static void verifyNullableSourceNeedsManualHandling() throws Exception {
-        Fixture fixture = new Fixture();
-        fixture.add(FIRST_SOURCE, integer(ID), text(NAME, 30));
-        fixture.add(FIRST_TARGET, integer(ID),
-            new Column(NAME, Types.VARCHAR, TEXT_TYPE, 10, 0, DatabaseMetaData.columnNoNulls));
-        fixture.mains.add(table(FIRST_SOURCE, FIRST_TARGET, "ROOT", null));
-        MigrationTask task = task(fixture, MYSQL);
-        assertTrue(validateFailure(task, fixture, MYSQL) instanceof IllegalArgumentException,
-            "目标更严格的非空约束未阻止执行");
-        assertContains(issueLogs(task), NAME, "非空约束差异未汇总");
-        String script = script(task);
-        assertContains(script, "不生成直接放宽非空约束的可执行 DDL", "缺少人工处理非空约束说明");
-        for (String line : script.split("\\r?\\n")) {
-            String statement = line.trim();
-            assertTrue(statement.startsWith("--") || !statement.contains(NAME),
-                "目标非空字段被写入可执行修改建议: " + line);
+    private static void verifyNullabilityChangesGenerateDdl() throws Exception {
+        for (String databaseType : Arrays.asList(MYSQL, MigrationConstants.DB_ORACLE, MigrationConstants.DB_DM)) {
+            boolean mysql = MYSQL.equals(databaseType);
+            String textType = MigrationConstants.DB_ORACLE.equals(databaseType) ? ORACLE_TEXT_TYPE : TEXT_TYPE;
+            for (boolean sourceNullable : Arrays.asList(Boolean.TRUE, Boolean.FALSE)) {
+                for (boolean changeLength : Arrays.asList(Boolean.FALSE, Boolean.TRUE)) {
+                    int sourceLength = changeLength ? 30 : 20;
+                    int targetLength = changeLength ? 10 : 20;
+                    int sourceRule = sourceNullable ? DatabaseMetaData.columnNullable : DatabaseMetaData.columnNoNulls;
+                    int targetRule = sourceNullable ? DatabaseMetaData.columnNoNulls : DatabaseMetaData.columnNullable;
+                    Fixture fixture = new Fixture();
+                    fixture.add(FIRST_SOURCE, integer(ID),
+                        new Column(NAME, Types.VARCHAR, textType, sourceLength, 0, sourceRule));
+                    fixture.add(FIRST_TARGET, integer(ID),
+                        new Column(NAME, Types.VARCHAR, textType, targetLength, 0, targetRule));
+                    fixture.mains.add(table(FIRST_SOURCE, FIRST_TARGET, "ROOT", null));
+                    MigrationTask task = task(fixture, databaseType);
+                    assertTrue(validateFailure(task, fixture, databaseType) instanceof IllegalArgumentException,
+                        databaseType + "可空性差异未阻止数据执行");
+                    assertContains(issueLogs(task), NAME, databaseType + "可空性差异未汇总");
+                    String quote = mysql ? "`" : "\"";
+                    String columnDefinition = quote + NAME + quote + " " + textType + "(" + sourceLength + ")"
+                        + (sourceNullable ? " NULL" : " NOT NULL");
+                    String statement = "ALTER TABLE " + quote + FIRST_TARGET + quote
+                        + (mysql ? " MODIFY COLUMN " + columnDefinition : " MODIFY (" + columnDefinition + ")") + ";";
+                    assertExecutableStatement(script(task), statement,
+                        databaseType + "未按源定义生成可执行约束变更: sourceNullable=" + sourceNullable
+                            + ", changeLength=" + changeLength);
+                    assertEquals(NO_WRITES, fixture.writes, "可空性预检执行了DDL或数据操作");
+                }
+            }
         }
-        assertEquals(NO_WRITES, fixture.writes, "非空约束不通过后执行了数据操作");
     }
 
     /**
@@ -252,7 +274,8 @@ public class ArchiveStructureValidationCheck {
                 new Column(NAME, Types.VARCHAR, textType, 10, 0, DatabaseMetaData.columnNullable),
                 new Column(AMOUNT_COLUMN, jdbcDecimal, decimalType, 6, 0, DatabaseMetaData.columnNullable),
                 new Column(REQUIRED_COLUMN, Types.VARCHAR, textType, 10, 0, DatabaseMetaData.columnNoNulls),
-                new Column(TIGHTEN_COLUMN, Types.VARCHAR, textType, 10, 0, DatabaseMetaData.columnNullable));
+                new Column(TIGHTEN_COLUMN, Types.VARCHAR, textType, 10, 0, DatabaseMetaData.columnNullable),
+                new Column(EXTRA_COLUMN, Types.VARCHAR, textType, 8, 0, DatabaseMetaData.columnNullable));
             fixture.add(MISSING_SOURCE, id,
                 new Column("PAYLOAD", Types.VARCHAR, textType, 24, 0, DatabaseMetaData.columnNullable));
             fixture.tables.put(MISSING_TARGET, null);
@@ -283,6 +306,8 @@ public class ArchiveStructureValidationCheck {
                 databaseType + "缺表错误号未识别或建表引用错误");
             assertContains(script, "\"" + ID + "\" " + decimalType + "(12,0) NOT NULL",
                 databaseType + "建表丢失源字段非空约束");
+            assertExecutableStatement(script, "ALTER TABLE " + quotedTarget + " DROP COLUMN \""
+                + EXTRA_COLUMN + "\";", databaseType + "目标多余字段未生成 DROP COLUMN");
             assertEquals(NO_WRITES, fixture.writes, databaseType + "预检执行了DDL或数据写入");
         }
     }
@@ -311,6 +336,210 @@ public class ArchiveStructureValidationCheck {
         }
         assertTrue(fixture.physicalTablesRead.containsKey(SECOND_SOURCE), "目标重复导致后续源表不再检查");
         assertEquals(NO_WRITES, fixture.writes, "目标重复时执行了数据操作");
+    }
+
+    /**
+     * Oracle 业务派生查询报告未知 NUMBER 精度及可空性时，两阶段校验均通过且仍不执行写删。
+     * Params: 无。
+     * Returns: 无。
+     */
+    private static void verifyOracleUnknownQueryMetadataThroughPrepare() throws Exception {
+        for (Column queryId : Arrays.asList(
+            new Column(ID, Types.NUMERIC, NUMBER_TYPE, 0, -127, DatabaseMetaData.columnNullable),
+            new Column(ID, Types.NUMERIC, NUMBER_TYPE, 20, 0, DatabaseMetaData.columnNullable))) {
+            Fixture fixture = oracleQueryFixture(queryId);
+            MigrationTask task = task(fixture, MigrationConstants.DB_ORACLE);
+            Object prepared = prepare(task, fixture, MigrationConstants.DB_ORACLE);
+            assertTrue(prepared != null, "Oracle 未知派生精度或可空性在最终归档准备阶段仍被拦截");
+            assertEquals(EXPECTED_METADATA_PHASES, fixture.businessMetadataReads,
+                "没有同时检查结构预检和引擎最终查询元数据");
+            assertEquals(FIRST_QUERY, fixture.statisticsQueries, "完整归档准备未执行键范围校验");
+            assertTrue(issueLogs(task).isEmpty(), "合法的 Oracle 派生元数据仍被报为结构差异");
+            for (String sql : fixture.queries) {
+                if (!sql.contains(BUSINESS_QUERY_MARKER)) {
+                    assertTrue(!sql.contains(DERIVED_QUERY_PREFIX),
+                        "Oracle 物理表元数据不能使用派生包装，避免丢失真实精度: " + sql);
+                }
+            }
+            assertEquals(NO_WRITES, fixture.writes, "完整准备阶段执行了DDL或数据写删");
+        }
+    }
+
+    /**
+     * 已知精度、小数位、原生类型及 JDBC 类型错误不能套用未知元数据兼容规则。
+     * Params: 无。
+     * Returns: 无。
+     */
+    private static void verifyKnownQueryMetadataDifferencesRemainRejected() throws Exception {
+        List<Column> invalid = Arrays.asList(
+            new Column(ID, Types.NUMERIC, NUMBER_TYPE, 19, 0, DatabaseMetaData.columnNullable),
+            new Column(ID, Types.NUMERIC, NUMBER_TYPE, 20, 1, DatabaseMetaData.columnNullable),
+            new Column(ID, Types.NUMERIC, NUMBER_TYPE, 0, 0, DatabaseMetaData.columnNullable),
+            new Column(ID, Types.NUMERIC, "DECIMAL", 0, -127, DatabaseMetaData.columnNullable),
+            new Column(ID, Types.DECIMAL, NUMBER_TYPE, 0, -127, DatabaseMetaData.columnNullable),
+            new Column(ID, Types.VARCHAR, NUMBER_TYPE, 0, -127, DatabaseMetaData.columnNullable));
+        for (Column queryColumn : invalid) {
+            Fixture fixture = oracleQueryFixture(queryColumn);
+            MigrationTask task = task(fixture, MigrationConstants.DB_ORACLE);
+            assertTrue(validateFailure(task, fixture, MigrationConstants.DB_ORACLE)
+                instanceof IllegalArgumentException, "已知 Oracle 查询字段定义错误被预检放过");
+            assertContains(issueLogs(task), ID, "Oracle 已知字段定义错误没有汇总");
+            assertFinalQueryValidationRejected(queryColumn, MigrationConstants.DB_ORACLE);
+        }
+        Column oracleUnknown = new Column(ID, Types.NUMERIC, NUMBER_TYPE, 0, -127,
+            DatabaseMetaData.columnNullable);
+        for (String databaseType : Arrays.asList(MYSQL, MigrationConstants.DB_DM)) {
+            Fixture fixture = oracleQueryFixture(oracleUnknown);
+            MigrationTask task = task(fixture, databaseType);
+            assertTrue(validateFailure(task, fixture, databaseType) instanceof IllegalArgumentException,
+                databaseType + "错误套用了 Oracle NUMBER 未知精度规则");
+            assertFinalQueryValidationRejected(oracleUnknown, databaseType);
+        }
+    }
+
+    /**
+     * Oracle 查询元数据兼容不能掩盖源物理表与归档物理表的真实差异。
+     * Params: 无。
+     * Returns: 无。
+     */
+    private static void verifyOracleUnknownQueryDoesNotHidePhysicalDifferences() throws Exception {
+        Fixture fixture = oracleQueryFixture(
+            new Column(ID, Types.NUMERIC, NUMBER_TYPE, 0, -127, DatabaseMetaData.columnNullable));
+        fixture.add(FIRST_TARGET,
+            new Column(ID, Types.NUMERIC, NUMBER_TYPE, 19, 0, DatabaseMetaData.columnNoNulls),
+            new Column(NAME, Types.VARCHAR, ORACLE_TEXT_TYPE, 30, 0, DatabaseMetaData.columnNoNulls));
+        MigrationTask task = task(fixture, MigrationConstants.DB_ORACLE);
+        assertTrue(validateFailure(task, fixture, MigrationConstants.DB_ORACLE) instanceof IllegalArgumentException,
+            "查询未知精度兼容规则掩盖了物理字段的真实精度差异");
+        assertContains(issueLogs(task), ID, "物理字段精度差异未汇总");
+        assertExecutableStatement(script(task), "ALTER TABLE \"" + FIRST_TARGET + "\" MODIFY (\""
+            + ID + "\" NUMBER(20,0));", "物理字段精度差异没有生成准确的建议 DDL");
+        assertEquals(NO_WRITES, fixture.writes, "物理结构不通过时执行了数据变更");
+    }
+
+    /**
+     * 已有完整原生类型信息可以直接用于归档增列，不能仅因不在旧白名单中退为人工说明。
+     * Params: 无。
+     * Returns: 无。
+     */
+    private static void verifyNativeTypesProduceExecutableDdl() throws Exception {
+        verifyNativeTypeAdditions(MYSQL, Arrays.asList(
+            new Column("YEAR_VALUE", Types.DATE, "YEAR", 4, 0, DatabaseMetaData.columnNullable),
+            new Column("BIT_VALUE", Types.BIT, "BIT(8)", 8, 0, DatabaseMetaData.columnNullable),
+            new Column("INT_VALUE", Types.INTEGER, "INT(11)", 10, 0, DatabaseMetaData.columnNullable),
+            new Column("DEC_VALUE", Types.DECIMAL, "DECIMAL(10,2) UNSIGNED", 10, 2,
+                DatabaseMetaData.columnNullable),
+            new Column("NATIVE_VALUE", Types.OTHER, "CUSTOM_NATIVE", 0, 0, DatabaseMetaData.columnNullable)));
+        verifyNativeTypeAdditions(MigrationConstants.DB_ORACLE, Arrays.asList(
+            new Column("CHAR_VALUE", Types.VARCHAR, "VARCHAR2(80 CHAR)", 80, 0,
+                DatabaseMetaData.columnNullable),
+            new Column("BYTE_VALUE", Types.VARCHAR, "VARCHAR2(80 BYTE)", 80, 0,
+                DatabaseMetaData.columnNullable),
+            new Column("RID_VALUE", Types.ROWID, "UROWID(4000)", 4000, 0,
+                DatabaseMetaData.columnNullable),
+            new Column("NATIVE_VALUE", Types.OTHER, "CUSTOM_NUMBER(12,3)", 12, 3,
+                DatabaseMetaData.columnNullable)));
+        verifyNativeTypeAdditions(MigrationConstants.DB_DM, Arrays.asList(
+            new Column("NATIVE_VALUE", Types.OTHER, "APP.CUSTOM_NATIVE", 0, 0,
+                DatabaseMetaData.columnNullable)));
+    }
+
+    /**
+     * 检查完整原生类型是否出现在未注释的生产建议 SQL 中。
+     * Params: databaseType 方言；nativeColumns 含完整原生类型的字段。
+     * Returns: 无。
+     */
+    private static void verifyNativeTypeAdditions(String databaseType, List<Column> nativeColumns)
+        throws Exception {
+        Fixture fixture = new Fixture();
+        List<Column> sourceColumns = new ArrayList<>();
+        sourceColumns.add(integer(ID));
+        sourceColumns.addAll(nativeColumns);
+        fixture.add(FIRST_SOURCE, sourceColumns.toArray(new Column[sourceColumns.size()]));
+        fixture.add(FIRST_TARGET, integer(ID));
+        fixture.mains.add(table(FIRST_SOURCE, FIRST_TARGET, "ROOT", null));
+        MigrationTask task = task(fixture, databaseType);
+        assertTrue(validateFailure(task, fixture, databaseType) instanceof IllegalArgumentException,
+            databaseType + "原生字段缺失没有阻止数据执行");
+        boolean mysql = MYSQL.equals(databaseType);
+        String quote = mysql ? "`" : "\"";
+        for (Column column : nativeColumns) {
+            String definition = quote + column.name + quote + " " + column.typeName + " NULL";
+            String statement = "ALTER TABLE " + quote + FIRST_TARGET + quote
+                + (mysql ? " ADD COLUMN " + definition : " ADD (" + definition + ")") + ";";
+            assertExecutableStatement(script(task), statement,
+                databaseType + "完整原生类型没有生成可执行建议: " + column.typeName);
+        }
+        assertEquals(NO_WRITES, fixture.writes, "原生类型预检执行了DDL或数据写入");
+    }
+
+    /**
+     * 独立调用引擎最终查询字段校验，防止两阶段兼容规则不一致。
+     * Params: queryColumn 业务查询的 ID 字段；databaseType 方言。
+     * Returns: 无。
+     */
+    private static void assertFinalQueryValidationRejected(Column queryColumn, String databaseType)
+        throws Exception {
+        Class<?> columnClass = Class.forName(ArchiveEngine.class.getName() + "$ColumnMeta");
+        java.lang.reflect.Constructor<?> constructor = columnClass.getDeclaredConstructor(String.class,
+            int.class, String.class, int.class, int.class, int.class);
+        constructor.setAccessible(true);
+        Object source = constructor.newInstance(ID, Types.NUMERIC, NUMBER_TYPE, 20, 0,
+            DatabaseMetaData.columnNoNulls);
+        Object query = constructor.newInstance(queryColumn.name, queryColumn.jdbcType, queryColumn.typeName,
+            queryColumn.precision, queryColumn.scale, queryColumn.nullable);
+        Method validate = ArchiveEngine.class.getDeclaredMethod("validateQueryCoversSourceTable", List.class,
+            List.class, String.class, String.class);
+        validate.setAccessible(true);
+        Throwable failure = null;
+        try {
+            validate.invoke(new ArchiveEngine(), Arrays.asList(query), Arrays.asList(source), "QUERY_CHECK",
+                databaseType);
+        } catch (InvocationTargetException exception) {
+            failure = exception.getCause();
+        }
+        assertTrue(failure instanceof IllegalArgumentException,
+            databaseType + "最终引擎查询校验放过了已知字段差异");
+    }
+
+    /**
+     * 创建 Oracle 物理元数据稳定、业务派生查询元数据独立的主表。
+     * Params: queryId 派生查询 ID 字段。
+     * Returns: JDBC 验证数据。
+     */
+    private static Fixture oracleQueryFixture(Column queryId) {
+        Fixture fixture = new Fixture();
+        Column id = new Column(ID, Types.NUMERIC, NUMBER_TYPE, 20, 0, DatabaseMetaData.columnNoNulls);
+        Column name = new Column(NAME, Types.VARCHAR, ORACLE_TEXT_TYPE, 30, 0, DatabaseMetaData.columnNoNulls);
+        fixture.add(FIRST_SOURCE, id, name);
+        fixture.add(FIRST_TARGET, id, name);
+        fixture.businessColumns = Arrays.asList(queryId,
+            new Column(NAME, Types.VARCHAR, ORACLE_TEXT_TYPE, 30, 0, DatabaseMetaData.columnNullable));
+        ArchiveTableRequest main = table(FIRST_SOURCE, FIRST_TARGET, "ROOT", null);
+        main.setSourceSql("SELECT ID, NAME FROM " + FIRST_SOURCE + " /* " + BUSINESS_QUERY_MARKER + " */");
+        main.setCursorColumn(ID);
+        fixture.mains.add(main);
+        return fixture;
+    }
+
+    /**
+     * 调用归档完整准备入口，让结构预检和执行前最终校验都走生产代码。
+     * Params: task 当前任务；fixture JDBC 验证数据；databaseType 方言。
+     * Returns: 生产准备结果。
+     */
+    private static Object prepare(MigrationTask task, Fixture fixture, String databaseType) throws Exception {
+        Method prepare = ArchiveEngine.class.getDeclaredMethod("prepare", MigrationTask.class,
+            Connection.class, String.class);
+        prepare.setAccessible(true);
+        try {
+            return prepare.invoke(new ArchiveEngine(), task, fixture.connection(), databaseType);
+        } catch (InvocationTargetException exception) {
+            Throwable cause = exception.getCause();
+            if (cause instanceof Exception) {
+                throw (Exception)cause;
+            }
+            throw exception;
+        }
     }
 
     /**
@@ -448,6 +677,20 @@ public class ArchiveStructureValidationCheck {
     }
 
     /**
+     * 断言脚本中存在未注释的完整 SQL 行，而非仅在人工说明中出现。
+     * Params: script 脚本；expected 期望的可执行语句；message 失败说明。
+     * Returns: 无。
+     */
+    private static void assertExecutableStatement(String script, String expected, String message) {
+        for (String line : script.split("\\r?\\n")) {
+            if (expected.equals(line.trim())) {
+                return;
+            }
+        }
+        throw new AssertionError(message + ": " + script);
+    }
+
+    /**
      * 断言数值相等。
      * Params: expected 期望；actual 实际；message 失败说明。
      * Returns: 无。
@@ -515,6 +758,12 @@ public class ArchiveStructureValidationCheck {
         private int missingCode = MISSING_CODE;
         /** 写入操作数。 */
         private int writes;
+        /** 业务派生查询专用元数据，物理表元数据不受影响。 */
+        private List<Column> businessColumns;
+        /** 业务查询元数据读取次数。 */
+        private int businessMetadataReads;
+        /** 归档键统计查询次数。 */
+        private int statisticsQueries;
 
         /**
          * 注册物理表。
@@ -588,6 +837,22 @@ public class ArchiveStructureValidationCheck {
             queries.add(sql);
             assertTrue(sql.trim().toUpperCase(Locale.ROOT).startsWith(SELECT_PREFIX),
                 "预检不是 SELECT 查询: " + sql);
+            if (sql.trim().toUpperCase(Locale.ROOT).startsWith(COUNT_QUERY_PREFIX)) {
+                statisticsQueries++;
+                final boolean[] firstRow = {true};
+                return proxy(ResultSet.class, (object, method, arguments) -> {
+                    switch (method.getName()) {
+                        case "next":
+                            boolean next = firstRow[0];
+                            firstRow[0] = false;
+                            return next;
+                        case "getLong":
+                            return SINGLE_ROW;
+                        default:
+                            return defaultValue(method.getReturnType());
+                    }
+                });
+            }
             for (Map.Entry<String, List<Column>> entry : tables.entrySet()) {
                 String table = entry.getKey();
                 if (Pattern.compile("\\b" + Pattern.quote(table) + "\\b", Pattern.CASE_INSENSITIVE)
@@ -599,6 +864,10 @@ public class ArchiveStructureValidationCheck {
                     List<Column> columns = entry.getValue();
                     if (columns == null) {
                         throw new SQLException("Table " + table + " doesn't exist", missingState, missingCode);
+                    }
+                    if (sql.contains(BUSINESS_QUERY_MARKER) && businessColumns != null) {
+                        columns = businessColumns;
+                        businessMetadataReads++;
                     }
                     ResultSetMetaData metadata = metadata(columns);
                     return proxy(ResultSet.class, (object, method, arguments) -> {

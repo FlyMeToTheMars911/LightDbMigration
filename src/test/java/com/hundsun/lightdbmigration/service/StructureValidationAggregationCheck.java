@@ -40,7 +40,7 @@ public class StructureValidationAggregationCheck {
     private static final String TARGET_ONE = "TARGET_ONE";
     private static final String TARGET_TWO = "TARGET_TWO";
     private static final String ISSUE_LOG_PREFIX = "表结构校验问题";
-    private static final int EXPECTED_ISSUES = 7;
+    private static final int EXPECTED_ISSUES = 8;
     private static final int EXPECTED_STEPS = 2;
     private static final long MOCK_TOTAL_ROWS = 2L;
     private static final String APPLICATION_CURSOR = "APP_UUID";
@@ -96,17 +96,19 @@ public class StructureValidationAggregationCheck {
         String structureSyncScript = String.valueOf(snapshot.get("structureSyncScript"));
         assertContains(structureSyncScript, "工具不会未经确认执行", "同步脚本缺少确认要求");
         assertContains(structureSyncScript,
-            "ALTER TABLE `" + TARGET_ONE + "` MODIFY COLUMN `A` VARCHAR(20);",
+            "ALTER TABLE `" + TARGET_ONE + "` MODIFY COLUMN `A` VARCHAR(20) NULL;",
             "同步脚本缺少文本扩容建议");
         assertContains(structureSyncScript,
-            "ALTER TABLE `" + TARGET_ONE + "` ADD COLUMN `B` DECIMAL(10,0) NULL;",
+            "ALTER TABLE `" + TARGET_ONE + "` ADD COLUMN `B` INT NULL;",
             "同步脚本缺少字段新增建议");
         assertContains(structureSyncScript,
-            "ALTER TABLE `" + TARGET_TWO + "` MODIFY COLUMN `X` DECIMAL(10,0);",
+            "ALTER TABLE `" + TARGET_TWO + "` MODIFY COLUMN `X` INT NULL;",
             "同步脚本缺少跨类型调整建议");
         assertContains(structureSyncScript,
             "ALTER TABLE `" + TARGET_TWO + "` ADD COLUMN `Y` VARCHAR(10) NULL;",
             "同步脚本缺少后续步骤的字段新增建议");
+        assertContains(structureSyncScript, "ALTER TABLE `" + TARGET_TWO + "` DROP COLUMN `Z`;",
+            "同步脚本缺少目标多余字段删除建议");
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> logs = (List<Map<String, Object>>)snapshot.get("logs");
         List<String> issueLogs = new ArrayList<>();
@@ -131,8 +133,14 @@ public class StructureValidationAggregationCheck {
         verifyMetadataFailureKeepsLaterSteps(engine);
         verifyNumericReadFailureKeepsOtherFields(engine);
         verifyScriptCommentsAndConflictingSuggestions(engine);
-        verifyModifyPreservesTargetConstraints(engine);
+        verifyModifyAlignsSourceConstraints(engine);
         verifyDefaultNamespaceAliases(engine);
+        verifyAllFieldDefinitionDifferences(engine);
+        verifyCrossDatabaseMappedDefinitions(engine);
+        verifyKeepAndDropConflict(engine);
+        verifyBooleanMappingRoundTrip(engine);
+        verifyLobMappingRoundTrip(engine);
+        verifyUnspecifiedFloatingScaleRoundTrip(engine);
     }
 
     private void verifyDefaultNamespaceAliases(MigrationEngine engine) throws Exception {
@@ -180,6 +188,243 @@ public class StructureValidationAggregationCheck {
         for (String statement : ambiguous) {
             assertNoExecutableLine(statement, "ALTER TABLE", "默认库不可读取时仍输出歧义目标的可执行建议");
         }
+    }
+
+    private void verifyAllFieldDefinitionDifferences(MigrationEngine engine) throws Exception {
+        List<ColumnDef> source = Arrays.asList(
+            column("ID", Types.INTEGER, "INT", 10, 0, DatabaseMetaData.columnNoNulls),
+            column("PROF_TYPE", Types.CHAR, "CHAR", 1),
+            column("TENANT_ID", Types.VARCHAR, "VARCHAR", 20, 0, DatabaseMetaData.columnNoNulls),
+            column("UserId", Types.VARCHAR, "VARCHAR", 30),
+            column("WIDE", Types.VARCHAR, "VARCHAR", 10),
+            column("AMOUNT", Types.DECIMAL, "DECIMAL", 10, 2, DatabaseMetaData.columnNullable),
+            column("KIND", Types.CHAR, "CHAR", 3),
+            column("MISSING", Types.INTEGER, "INT", 10, 0, DatabaseMetaData.columnNoNulls));
+        List<ColumnDef> target = Arrays.asList(
+            column("ID", Types.INTEGER, "INTEGER", 10, 0, DatabaseMetaData.columnNoNulls),
+            column("PROF_TYPE", Types.CHAR, "CHAR", 1, 0, DatabaseMetaData.columnNoNulls),
+            column("TENANT_ID", Types.VARCHAR, "VARCHAR", 20),
+            column("UserId", Types.VARCHAR, "VARCHAR", 30, 0, DatabaseMetaData.columnNoNulls),
+            column("WIDE", Types.VARCHAR, "VARCHAR", 100),
+            column("AMOUNT", Types.DECIMAL, "DECIMAL", 15, 4, DatabaseMetaData.columnNullable),
+            column("KIND", Types.VARCHAR, "VARCHAR", 3),
+            column("EXTRA", Types.VARCHAR, "VARCHAR", 20));
+        String script = validateDefinitions(engine, source, target,
+            MigrationConstants.DB_MYSQL, MigrationConstants.DB_MYSQL, true);
+        for (String expected : Arrays.asList(
+            "MODIFY COLUMN `PROF_TYPE` CHAR(1) NULL;",
+            "MODIFY COLUMN `TENANT_ID` VARCHAR(20) NOT NULL;",
+            "MODIFY COLUMN `UserId` VARCHAR(30) NULL;",
+            "MODIFY COLUMN `WIDE` VARCHAR(10) NULL;",
+            "MODIFY COLUMN `AMOUNT` DECIMAL(10,2) NULL;",
+            "MODIFY COLUMN `KIND` CHAR(3) NULL;",
+            "ADD COLUMN `MISSING` INT NOT NULL;",
+            "DROP COLUMN `EXTRA`;")) {
+            assertContains(script, expected, "可识别字段差异缺少直接 DDL");
+        }
+        if (script.contains("MODIFY COLUMN `ID`")) {
+            throw new AssertionError("同库 INT 与 INTEGER 同义定义被误报");
+        }
+        validateDefinitions(engine, source.subList(0, 1), target.subList(0, 1),
+            MigrationConstants.DB_MYSQL, MigrationConstants.DB_MYSQL, false);
+        String unknown = validateDefinitions(engine,
+            Arrays.asList(column("NAME", Types.VARCHAR, "VARCHAR", 10, 0, DatabaseMetaData.columnNullableUnknown)),
+            Arrays.asList(column("NAME", Types.VARCHAR, "VARCHAR", 10)),
+            MigrationConstants.DB_MYSQL, MigrationConstants.DB_MYSQL, true);
+        assertContains(unknown, "可空性未知", "未知源可空性未说明原因");
+        assertNoExecutableLine(unknown, "ALTER TABLE", "未知源可空性被伪造为 NULL 或 NOT NULL");
+    }
+
+    private void verifyCrossDatabaseMappedDefinitions(MigrationEngine engine) throws Exception {
+        List<ColumnDef> oracle = Arrays.asList(column("ID", Types.NUMERIC, "NUMBER", 20));
+        List<ColumnDef> mysql = Arrays.asList(column("ID", Types.DECIMAL, "DECIMAL", 20));
+        validateDefinitions(engine, oracle, mysql, MigrationConstants.DB_ORACLE, MigrationConstants.DB_MYSQL, false);
+        String bigint = validateDefinitions(engine, oracle,
+            Arrays.asList(column("ID", Types.BIGINT, "BIGINT", 19)),
+            MigrationConstants.DB_ORACLE, MigrationConstants.DB_MYSQL, true);
+        assertContains(bigint, "MODIFY COLUMN `ID` DECIMAL(20,0) NULL;",
+            "跨库当前值兼容没有继续对齐映射后的数字定义");
+        validateDefinitions(engine, Arrays.asList(column("NAME", Types.VARCHAR, "VARCHAR", 20)),
+            Arrays.asList(column("NAME", Types.VARCHAR, "VARCHAR2", 20)),
+            MigrationConstants.DB_MYSQL, MigrationConstants.DB_ORACLE, false);
+        validateDefinitions(engine, Arrays.asList(column("NAME", Types.VARCHAR, "VARCHAR", 20)),
+            Arrays.asList(column("NAME", Types.VARCHAR, "VARCHAR", 20)),
+            MigrationConstants.DB_MYSQL, MigrationConstants.DB_DM, false);
+        Method definition = MigrationEngine.class.getDeclaredMethod("targetTypeDefinition",
+            Class.forName(MigrationEngine.class.getName() + "$ColumnMeta"), String.class);
+        definition.setAccessible(true);
+        assertContains(String.valueOf(definition.invoke(engine,
+            columnMeta("AREA", Types.OTHER, "GEOMETRY", 0), MigrationConstants.DB_MYSQL)),
+            "GEOMETRY", "合法同库原生类型没有保留");
+        assertContains(String.valueOf(definition.invoke(engine,
+            columnMeta("NATIVE", Types.OTHER, "CUSTOM_NUMBER(12,3)", 0), MigrationConstants.DB_MYSQL)),
+            "CUSTOM_NUMBER(12,3)", "合法同库带参数类型没有保留");
+        assertContains(String.valueOf(definition.invoke(engine,
+            columnMeta("NATIVE", Types.VARCHAR, "VARCHAR2(80 CHAR)", 80), MigrationConstants.DB_ORACLE)),
+            "VARCHAR2(80 CHAR)", "合法 Oracle 字符长度语义没有保留");
+    }
+
+    private void verifyBooleanMappingRoundTrip(MigrationEngine engine) throws Exception {
+        List<ColumnDef> source = Arrays.asList(column("FLAG", Types.BOOLEAN, "BOOLEAN", 1));
+        for (int reportedType : Arrays.asList(Types.BIT, Types.BOOLEAN)) {
+            String script = validateDefinitions(engine, source,
+                Arrays.asList(column("FLAG", reportedType, "BIT", 1)),
+                MigrationConstants.DB_DM, MigrationConstants.DB_MYSQL, true);
+            assertContains(script, "MODIFY COLUMN `FLAG` TINYINT NULL;",
+                "布尔映射仍生成会被驱动解释为 BIT/BOOLEAN 的 TINYINT(1)");
+        }
+        validateDefinitions(engine, source, Arrays.asList(column("FLAG", Types.TINYINT, "TINYINT", 3)),
+            MigrationConstants.DB_DM, MigrationConstants.DB_MYSQL, false);
+        validateDefinitions(engine, source, Arrays.asList(column("FLAG", Types.BOOLEAN, "TINYINT", 1)),
+            MigrationConstants.DB_DM, MigrationConstants.DB_MYSQL, false);
+        String dmScript = validateDefinitions(engine, source,
+            Arrays.asList(column("FLAG", Types.INTEGER, "INT", 10)),
+            MigrationConstants.DB_ORACLE, MigrationConstants.DB_DM, true);
+        assertContains(dmScript, "MODIFY (\"FLAG\" DECIMAL(1,0));", "达梦布尔映射未使用目标规范类型");
+        validateDefinitions(engine, source, Arrays.asList(column("FLAG", Types.DECIMAL, "DECIMAL", 1)),
+            MigrationConstants.DB_ORACLE, MigrationConstants.DB_DM, false);
+        validateDefinitions(engine, source, Arrays.asList(column("FLAG", Types.NUMERIC, "NUMBER", 1)),
+            MigrationConstants.DB_ORACLE, MigrationConstants.DB_DM, false);
+        validateDefinitions(engine, source, Arrays.asList(column("FLAG", Types.NUMERIC, "NUMBER", 1)),
+            MigrationConstants.DB_DM, MigrationConstants.DB_ORACLE, false);
+    }
+
+    private void verifyLobMappingRoundTrip(MigrationEngine engine) throws Exception {
+        List<ColumnDef> oracle = Arrays.asList(column("CONTENT", Types.CLOB, "CLOB", Integer.MAX_VALUE));
+        List<ColumnDef> mysql = Arrays.asList(column("CONTENT", Types.LONGVARCHAR, "LONGTEXT", 1073741823));
+        validateDefinitions(engine, oracle, mysql,
+            MigrationConstants.DB_ORACLE, MigrationConstants.DB_MYSQL, false);
+        String script = validateDefinitions(engine, oracle,
+            Arrays.asList(column("CONTENT", Types.VARCHAR, "VARCHAR", 100)),
+            MigrationConstants.DB_ORACLE, MigrationConstants.DB_MYSQL, true);
+        assertContains(script, "MODIFY COLUMN `CONTENT` LONGTEXT NULL;",
+            "LOB 映射忽略 JDBC 上限差异时漏掉了真实目标类型差异");
+    }
+
+    private void verifyUnspecifiedFloatingScaleRoundTrip(MigrationEngine engine) throws Exception {
+        List<ColumnDef> mysqlFloat = Arrays.asList(column("VALUE", Types.REAL, "FLOAT", 12, 31,
+            DatabaseMetaData.columnNullable));
+        List<ColumnDef> mysqlDouble = Arrays.asList(column("VALUE", Types.DOUBLE, "DOUBLE", 22, 31,
+            DatabaseMetaData.columnNullable));
+        validateDefinitions(engine, mysqlFloat, mysqlFloat,
+            MigrationConstants.DB_MYSQL, MigrationConstants.DB_MYSQL, false);
+        validateDefinitions(engine, mysqlDouble, mysqlDouble,
+            MigrationConstants.DB_MYSQL, MigrationConstants.DB_MYSQL, false);
+        String script = validateDefinitions(engine, mysqlFloat, mysqlDouble,
+            MigrationConstants.DB_MYSQL, MigrationConstants.DB_MYSQL, true);
+        assertContains(script, "MODIFY COLUMN `VALUE` FLOAT NULL;", "未指定小数位的 FLOAT 拼出了协议标记 31");
+        List<ColumnDef> oracleFloat = Arrays.asList(column("VALUE", Types.REAL, "BINARY_FLOAT", 7, -127,
+            DatabaseMetaData.columnNullable));
+        List<ColumnDef> oracleDouble = Arrays.asList(column("VALUE", Types.DOUBLE, "BINARY_DOUBLE", 15, -127,
+            DatabaseMetaData.columnNullable));
+        validateDefinitions(engine, oracleFloat, mysqlFloat,
+            MigrationConstants.DB_ORACLE, MigrationConstants.DB_MYSQL, false);
+        validateDefinitions(engine, oracleDouble, mysqlDouble,
+            MigrationConstants.DB_ORACLE, MigrationConstants.DB_MYSQL, false);
+        String cross = validateDefinitions(engine, oracleFloat, mysqlDouble,
+            MigrationConstants.DB_ORACLE, MigrationConstants.DB_MYSQL, true);
+        assertContains(cross, "MODIFY COLUMN `VALUE` FLOAT NULL;", "跨库 FLOAT 建议含无效精度或回读仍不一致");
+        List<ColumnDef> declared = Arrays.asList(column("VALUE", Types.REAL, "FLOAT", 10, 2,
+            DatabaseMetaData.columnNullable));
+        String decimalScale = validateDefinitions(engine, declared, mysqlFloat,
+            MigrationConstants.DB_MYSQL, MigrationConstants.DB_MYSQL, true);
+        assertContains(decimalScale, "MODIFY COLUMN `VALUE` FLOAT(10,2) NULL;", "有效 FLOAT(M,D) 定义被丢失");
+        validateDefinitions(engine, declared, declared,
+            MigrationConstants.DB_MYSQL, MigrationConstants.DB_MYSQL, false);
+        validateDefinitions(engine, Arrays.asList(column("VALUE", Types.REAL, "FLOAT", 10, 20,
+            DatabaseMetaData.columnNullable)), mysqlFloat,
+            MigrationConstants.DB_MYSQL, MigrationConstants.DB_MYSQL, false);
+        validateDefinitions(engine, Arrays.asList(column("VALUE", Types.DOUBLE, "DOUBLE", 300, 2,
+            DatabaseMetaData.columnNullable)), mysqlDouble,
+            MigrationConstants.DB_MYSQL, MigrationConstants.DB_MYSQL, false);
+    }
+
+    private void verifyKeepAndDropConflict(MigrationEngine engine) throws Exception {
+        List<ColumnDef> columns = Arrays.asList(column("ID", Types.INTEGER, "INT", 10),
+            column("NAME", Types.VARCHAR, "VARCHAR", 20));
+        final Connection first = definitionConnection(columns);
+        final Connection second = definitionConnection(columns.subList(0, 1));
+        Connection source = proxy(Connection.class, (proxy, method, arguments) -> {
+            Connection selected = JDBC_PREPARE_STATEMENT.equals(method.getName())
+                && String.valueOf(arguments[0]).contains(SOURCE_TWO) ? second : first;
+            try {
+                return method.invoke(selected, arguments);
+            } catch (InvocationTargetException exception) {
+                throw exception.getCause();
+            }
+        });
+        CreateTaskRequest request = new CreateTaskRequest();
+        request.setSource(databaseConfig());
+        request.setTarget(databaseConfig());
+        request.setSteps(Arrays.asList(step("保留字段", "SELECT * FROM " + SOURCE_ONE, TARGET_ONE, null),
+            step("删除同表字段", "SELECT * FROM " + SOURCE_TWO, "test_db." + TARGET_ONE, null)));
+        MigrationTask task = new MigrationTask("KEEP-DROP-CONFLICT-CHECK", request);
+        Method prepare = MigrationEngine.class.getDeclaredMethod("prepareAllSteps", MigrationTask.class,
+            Connection.class, Connection.class, String.class, String.class);
+        prepare.setAccessible(true);
+        try {
+            prepare.invoke(engine, task, source, definitionConnection(columns),
+                MigrationConstants.DB_MYSQL, MigrationConstants.DB_MYSQL);
+            throw new AssertionError("字段集合差异没有触发预检失败");
+        } catch (InvocationTargetException exception) {
+            if (!(exception.getCause() instanceof IllegalArgumentException)) {
+                throw exception;
+            }
+        }
+        String script = String.valueOf(task.snapshot(true, 0L).get("structureSyncScript"));
+        assertContains(script, "存在冲突的源字段定义", "保留字段与删除同表字段的冲突没有被发现");
+        assertContains(script, "DROP COLUMN", "冲突字段的删除草稿被静默省略");
+        assertNoExecutableLine(script, "ALTER TABLE", "其他步骤仍需该字段时生成了可执行 DROP");
+    }
+
+    private String validateDefinitions(MigrationEngine engine, List<ColumnDef> source, List<ColumnDef> target,
+        String sourceType, String targetType, boolean expectedFailure) throws Exception {
+        CreateTaskRequest request = new CreateTaskRequest();
+        request.setSource(databaseConfig());
+        request.setTarget(databaseConfig());
+        request.setSteps(Arrays.asList(step("字段定义对齐", "SELECT * FROM " + SOURCE_ONE, TARGET_ONE, null)));
+        MigrationTask task = new MigrationTask("FIELD-DEFINITION-ALIGNMENT-CHECK", request);
+        Method prepare = MigrationEngine.class.getDeclaredMethod("prepareAllSteps", MigrationTask.class,
+            Connection.class, Connection.class, String.class, String.class);
+        prepare.setAccessible(true);
+        boolean failed = false;
+        try {
+            prepare.invoke(engine, task, definitionConnection(source), definitionConnection(target), sourceType, targetType);
+        } catch (InvocationTargetException exception) {
+            if (!(exception.getCause() instanceof IllegalArgumentException)) {
+                throw exception;
+            }
+            failed = true;
+        }
+        if (failed != expectedFailure) {
+            throw new AssertionError("字段定义预检结果不正确，实际失败=" + failed + "，日志="
+                + task.snapshot(true, 0L).get("logs"));
+        }
+        return String.valueOf(task.snapshot(true, 0L).get("structureSyncScript"));
+    }
+
+    private Connection definitionConnection(final List<ColumnDef> columns) {
+        return proxy(Connection.class, (proxy, method, arguments) -> {
+            switch (method.getName()) {
+                case "prepareStatement":
+                    final String sql = String.valueOf(arguments[0]);
+                    return proxy(PreparedStatement.class, (statement, called, parameters) -> {
+                        switch (called.getName()) {
+                            case "executeQuery":
+                                return sql.contains("WHERE 1 = 0") ? metadataResultSet(columns) : countResultSet();
+                            default:
+                                return defaultValue(called.getReturnType());
+                        }
+                    });
+                case "getCatalog":
+                case "getSchema":
+                    return "test_db";
+                case "getMetaData":
+                    return databaseMetaData();
+                default:
+                    return defaultValue(method.getReturnType());
+            }
+        });
     }
 
     private void verifyMetadataFailureKeepsLaterSteps(MigrationEngine engine) throws Exception {
@@ -293,11 +538,11 @@ public class StructureValidationAggregationCheck {
         assertEquals(2, issues.size(), "一个数值字段读取失败阻止了其他数值字段的检查");
         assertLogContains(new ArrayList<>(issues), "字段 A 数值范围读取失败");
         assertLogContains(new ArrayList<>(issues), "字段 B 源查询实际范围");
-        assertContains(statements.toString(), "MODIFY COLUMN `B` DECIMAL(20,0) NOT NULL;",
-            "后续数值字段超限未生成保留目标非空约束的结构建议");
+        assertContains(statements.toString(), "MODIFY COLUMN `B` DECIMAL(20,0) NULL;",
+            "后续数值字段超限未生成按源可空性的结构建议");
     }
 
-    private void verifyModifyPreservesTargetConstraints(MigrationEngine engine) throws Exception {
+    private void verifyModifyAlignsSourceConstraints(MigrationEngine engine) throws Exception {
         Class<?> columnMetaClass = Class.forName(MigrationEngine.class.getName() + "$ColumnMeta");
         Method modify = MigrationEngine.class.getDeclaredMethod("addModifyColumnStatement", Set.class,
             QualifiedName.class, columnMetaClass, columnMetaClass, String.class);
@@ -308,14 +553,26 @@ public class StructureValidationAggregationCheck {
         modify.invoke(engine, statements, table, source,
             columnMeta("NAME", Types.VARCHAR, "VARCHAR", 10, DatabaseMetaData.columnNoNulls),
             MigrationConstants.DB_MYSQL);
-        assertContains(statements.toString(), "MODIFY COLUMN `NAME` VARCHAR(40) NOT NULL;",
-            "类型调整建议隐式放宽了目标已有非空约束");
+        assertContains(statements.toString(), "MODIFY COLUMN `NAME` VARCHAR(40) NULL;",
+            "修改建议未将目标非空约束对齐为源字段可空规则");
         statements.clear();
         modify.invoke(engine, statements, table, source,
             columnMeta("NAME", Types.VARCHAR, "VARCHAR", 10, DatabaseMetaData.columnNullableUnknown),
             MigrationConstants.DB_MYSQL);
-        assertContains(statements.toString(), "原有可空约束未知", "约束未知时未提示人工处理");
-        assertNoExecutableLine(statements.iterator().next(), "ALTER TABLE", "约束未知时仍生成了可执行 MODIFY");
+        assertContains(statements.toString(), "MODIFY COLUMN `NAME` VARCHAR(40) NULL;",
+            "目标可空性未知时未按已知的源字段定义生成修改建议");
+        statements.clear();
+        modify.invoke(engine, statements, table,
+            columnMeta("NAME", Types.VARCHAR, "VARCHAR", 40, DatabaseMetaData.columnNoNulls), source,
+            MigrationConstants.DB_MYSQL);
+        assertContains(statements.toString(), "MODIFY COLUMN `NAME` VARCHAR(40) NOT NULL;",
+            "修改建议未将目标可空规则对齐为源字段非空规则");
+        statements.clear();
+        modify.invoke(engine, statements, table,
+            columnMeta("NAME", Types.VARCHAR, "VARCHAR", 40, DatabaseMetaData.columnNullableUnknown), source,
+            MigrationConstants.DB_MYSQL);
+        assertContains(statements.toString(), "可空性未知", "源可空性未知时没有说明原因");
+        assertNoExecutableLine(statements.iterator().next(), "ALTER TABLE", "源可空性未知时生成了虚构定义");
     }
 
     private void verifyScriptCommentsAndConflictingSuggestions(MigrationEngine engine) throws Exception {
@@ -753,10 +1010,10 @@ public class StructureValidationAggregationCheck {
                         return column.precision;
                     }
                     if ("getScale".equals(name)) {
-                        return 0;
+                        return column.scale;
                     }
                     if ("isNullable".equals(name)) {
-                        return ResultSetMetaData.columnNullable;
+                        return column.nullable;
                     }
                     if ("isAutoIncrement".equals(name)) {
                         return false;
@@ -795,6 +1052,10 @@ public class StructureValidationAggregationCheck {
 
     private ColumnDef column(String name, int jdbcType, String typeName, int precision) {
         return new ColumnDef(name, jdbcType, typeName, precision);
+    }
+
+    private ColumnDef column(String name, int jdbcType, String typeName, int precision, int scale, int nullable) {
+        return new ColumnDef(name, jdbcType, typeName, precision, scale, nullable);
     }
 
     @SuppressWarnings("unchecked")
@@ -859,12 +1120,20 @@ public class StructureValidationAggregationCheck {
         private final int jdbcType;
         private final String typeName;
         private final int precision;
+        private final int scale;
+        private final int nullable;
 
         private ColumnDef(String name, int jdbcType, String typeName, int precision) {
+            this(name, jdbcType, typeName, precision, 0, DatabaseMetaData.columnNullable);
+        }
+
+        private ColumnDef(String name, int jdbcType, String typeName, int precision, int scale, int nullable) {
             this.name = name;
             this.jdbcType = jdbcType;
             this.typeName = typeName;
             this.precision = precision;
+            this.scale = scale;
+            this.nullable = nullable;
         }
     }
 }

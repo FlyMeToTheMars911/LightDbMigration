@@ -24,6 +24,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * 在归档写入和删除前独立检查全部节点，汇总字段差异及人工审核用的同库 DDL。
@@ -60,11 +62,13 @@ final class ArchiveStructureValidator {
     private static final Set<String> SIMPLE_TYPES = new LinkedHashSet<>(Arrays.asList(
         "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT", "BIT", "BOOLEAN", "BOOL",
         "FLOAT", "DOUBLE", "DOUBLE PRECISION", "REAL", "BINARY_FLOAT", "BINARY_DOUBLE", "DATE",
-        "CLOB", "NCLOB", "BLOB", "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT",
-        "TINYBLOB", "MEDIUMBLOB", "LONGBLOB", "LONG", "LONG RAW", "JSON"));
+        "CLOB", "NCLOB", "BLOB", "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT", "YEAR",
+        "TINYBLOB", "MEDIUMBLOB", "LONGBLOB", "LONG", "LONG RAW", "JSON", "BFILE", "ROWID",
+        "GEOMETRY", "POINT", "LINESTRING", "POLYGON", "MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON",
+        "GEOMETRYCOLLECTION"));
     /** 必须保留字段长度的已知同库类型。 */
     private static final Set<String> LENGTH_TYPES = new LinkedHashSet<>(Arrays.asList(
-        "CHAR", "VARCHAR", "VARCHAR2", "NCHAR", "NVARCHAR", "NVARCHAR2", "BINARY", "VARBINARY", "RAW"));
+        "CHAR", "VARCHAR", "VARCHAR2", "NCHAR", "NVARCHAR", "NVARCHAR2", "BINARY", "VARBINARY", "RAW", "UROWID"));
     /** 必须保留数字精度和小数位的同库类型。 */
     private static final Set<String> DECIMAL_TYPES = new LinkedHashSet<>(Arrays.asList(
         "DECIMAL", "DEC", "NUMERIC", "NUMBER"));
@@ -77,6 +81,20 @@ final class ArchiveStructureValidator {
     private static final String BIT_TYPE = "BIT";
     /** Oracle 时间类型的时区修饰起点。 */
     private static final String TIME_ZONE_SEPARATOR = " WITH ";
+    /** 可安全保留的驱动原生带参数类型名格式。 */
+    private static final Pattern NATIVE_PARAMETERIZED_TYPE = Pattern.compile(
+        "([A-Z]+(?: [A-Z]+)?)\\(([0-9]+)(?:,\\s*(-?[0-9]+))?\\)( WITH (?:LOCAL )?TIME ZONE)?");
+    /** 保留驱动已完整给出的原生标识符及数字参数，不接受任意 SQL 片段。 */
+    private static final Pattern SAFE_NATIVE_TYPE = Pattern.compile(
+        "[A-Z][A-Z0-9_$#]*(?:\\.[A-Z][A-Z0-9_$#]*)?(?:\\([0-9]+(?:,\\s*-?[0-9]+)?\\))?");
+    /** 保留原生字符类型中已经明确给出的字符或字节长度语义。 */
+    private static final Pattern NATIVE_CHARACTER_SEMANTICS = Pattern.compile(
+        "(?:CHAR|VARCHAR|VARCHAR2)\\([0-9]+ (?:CHAR|BYTE)\\)");
+    /** 类型名未给出足够定义时不能伪造其 DDL。 */
+    private static final Set<String> INCOMPLETE_NATIVE_TYPES = new LinkedHashSet<>(Arrays.asList(
+        "ENUM", "SET", "UNKNOWN", "OTHER", "NULL"));
+    /** 可以保留原生精度参数的浮点类型。 */
+    private static final String FLOAT_TYPE = "FLOAT";
     /** 禁止进入可执行建议的字段名控制字符。 */
     private static final String UNSAFE_FIELD_NAME_PATTERN = "(?s).*[\\p{Cc}\\p{Zl}\\p{Zp}].*";
 
@@ -342,29 +360,21 @@ final class ArchiveStructureValidator {
                 issues.add(label + "归档表缺少字段：" + column.name);
                 addColumn(statements, targetName, column, null, databaseType);
             } else if (!sameDefinition(column, targetColumn, true)) {
-                boolean relaxNotNull = column.nullable == DatabaseMetaData.columnNullable
-                    && targetColumn.nullable == DatabaseMetaData.columnNoNulls;
-                boolean unknownTargetNullable = targetColumn.nullable == DatabaseMetaData.columnNullableUnknown;
                 issues.add(label + "字段结构不同：" + column.name + "，源表=" + column.describe()
-                    + "，归档表=" + targetColumn.describe()
-                    + (relaxNotNull ? "；归档表非空约束严于源表，须人工确认，禁止直接放宽非空约束" : ""));
-                if (relaxNotNull) {
-                    statements.add("-- 归档表 " + comment(quoteTable(targetName, databaseType)) + " 的字段 "
-                        + comment(column.name) + " 为 NOT NULL，源表可空；须人工核对数据和约束，"
-                        + "不生成直接放宽非空约束的可执行 DDL；其他类型或长度差异也请一并人工处理。");
-                } else if (unknownTargetNullable) {
-                    statements.add("-- 归档表 " + comment(quoteTable(targetName, databaseType)) + " 的字段 "
-                        + comment(column.name) + " 可空约束未知，请人工确认后再调整字段定义；不生成可执行 MODIFY。");
-                } else {
-                    addColumn(statements, targetName, column, targetColumn, databaseType);
-                }
+                    + "，归档表=" + targetColumn.describe());
+                addColumn(statements, targetName, column, targetColumn, databaseType);
             }
         }
         for (Column column : targetByName.values()) {
             if (!sourceByName.containsKey(normalize(column.name))) {
                 issues.add(label + "归档表存在源表没有的字段：" + column.name);
-                statements.add("-- 归档表 " + comment(quoteTable(targetName, databaseType)) + " 多余字段 "
-                    + comment(column.name) + "：请人工确认数据、约束和业务用途后处理；不自动生成 DROP COLUMN。");
+                if (column.name == null || column.name.matches(UNSAFE_FIELD_NAME_PATTERN)) {
+                    statements.add("-- 归档表 " + comment(quoteTable(targetName, databaseType)) + " 多余字段 "
+                        + comment(column.name) + " 的名称无法安全引用，请人工删除该字段。");
+                } else {
+                    statements.add("ALTER TABLE " + quoteTable(targetName, databaseType) + " DROP COLUMN "
+                        + SqlSupport.quoteIdentifier(column.name, databaseType) + ";");
+                }
             }
         }
     }
@@ -390,7 +400,9 @@ final class ArchiveStructureValidator {
             Column sourceColumn = sourceByName.get(normalize(column.name));
             if (sourceColumn == null) {
                 issues.add(label + "归档查询返回了非源表字段或字段别名：" + column.name);
-            } else if (!sameDefinition(column, sourceColumn, !MigrationConstants.DB_DM.equals(databaseType))) {
+            } else if (!ArchiveQueryMetadataSupport.matches(databaseType, column.jdbcType, column.typeName,
+                column.precision, column.scale, column.nullable, sourceColumn.jdbcType, sourceColumn.typeName,
+                sourceColumn.precision, sourceColumn.scale, sourceColumn.nullable)) {
                 issues.add(label + "归档查询字段类型与源表不同：" + column.name + "，查询="
                     + column.describe() + "，源表=" + sourceColumn.describe());
             }
@@ -460,9 +472,7 @@ final class ArchiveStructureValidator {
         } else {
             operation = (modify ? " MODIFY (" : " ADD (") + definition + ")";
         }
-        statements.add("-- 人工确认后执行：类型转换、缩短长度、收紧精度或 NOT NULL 可能失败或损失数据；"
-            + "MySQL MODIFY 还须补齐原 DEFAULT、COMMENT、自增和字符集属性。" + LINE_BREAK
-            + "ALTER TABLE " + quotedTable + operation + ";");
+        statements.add("ALTER TABLE " + quotedTable + operation + ";");
     }
 
     /**
@@ -512,7 +522,7 @@ final class ArchiveStructureValidator {
     /**
      * 按同库类型名白名单保留类型，不把任意驱动文本拼入可执行 DDL。
      * Params: column 源物理字段；databaseType 同库方言。
-     * Returns: 可还原的类型定义，枚举、用户类型等未知类型返回 null。
+     * Returns: 可还原的原生类型定义；缺枚举值或明确未知的类型返回 null。
      */
     private String typeDefinition(Column column, String databaseType) {
         String type = normalize(column.typeName);
@@ -521,6 +531,26 @@ final class ArchiveStructureValidator {
             type = type.substring(0, type.length() - UNSIGNED_SUFFIX.length());
         }
         String suffix = unsigned ? UNSIGNED_SUFFIX : "";
+        int parameterIndex = type.indexOf('(');
+        String baseType = parameterIndex < UNKNOWN_PRECISION ? type : type.substring(0, parameterIndex);
+        if (INCOMPLETE_NATIVE_TYPES.contains(baseType)) {
+            return null;
+        }
+        if (NATIVE_CHARACTER_SEMANTICS.matcher(type).matches()) {
+            return type + suffix;
+        }
+        Matcher nativeType = NATIVE_PARAMETERIZED_TYPE.matcher(type);
+        if (nativeType.matches()) {
+            String base = nativeType.group(1);
+            String timeZone = nativeType.group(4) == null ? "" : nativeType.group(4);
+            boolean numeric = DECIMAL_TYPES.contains(base);
+            boolean length = LENGTH_TYPES.contains(base) && nativeType.group(3) == null && timeZone.isEmpty();
+            boolean temporal = TIME_TYPES.contains(base + timeZone) && nativeType.group(3) == null;
+            boolean floating = FLOAT_TYPE.equals(base) && nativeType.group(3) == null && timeZone.isEmpty();
+            if ((numeric && timeZone.isEmpty()) || length || temporal || floating) {
+                return type + suffix;
+            }
+        }
         if (LENGTH_TYPES.contains(type)) {
             return column.precision > UNKNOWN_PRECISION ? type + "(" + column.precision + ")" : null;
         }
@@ -542,7 +572,7 @@ final class ArchiveStructureValidator {
         if (BIT_TYPE.equals(type) && MigrationConstants.DB_MYSQL.equals(databaseType)) {
             return column.precision > UNKNOWN_PRECISION ? type + "(" + column.precision + ")" : null;
         }
-        return SIMPLE_TYPES.contains(type) ? type + suffix : null;
+        return SIMPLE_TYPES.contains(type) || SAFE_NATIVE_TYPE.matcher(type).matches() ? type + suffix : null;
     }
 
     /**
@@ -554,7 +584,6 @@ final class ArchiveStructureValidator {
         StringBuilder script = new StringBuilder("-- Light DB Migration 归档表结构同步建议脚本\n")
             .append("-- 数据库类型：").append(databaseType).append(LINE_BREAK)
             .append("-- 以源物理表字段为准；工具不会未经确认执行，归档写入和删除尚未开始。\n")
-            .append("-- 请先备份并核对默认值、自增、主键、索引、字符集、排序规则、长度语义和注释。\n")
             .append("-- 字段数量、名称、类型、精度、小数位及可空性之外的属性不在本次比对范围。\n\n")
             .append("-- 本次校验问题\n");
         int number = 1;

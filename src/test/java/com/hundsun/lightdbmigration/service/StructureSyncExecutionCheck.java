@@ -71,6 +71,7 @@ public final class StructureSyncExecutionCheck {
     public static void main(String[] args) throws Exception {
         verifyParserHandlesCommentsAndQuotedSemicolons();
         verifyParserRejectsUnsupportedStatements();
+        verifyDropColumnSuggestionsAreExecutable();
         verifyUnconfirmedAndStalePlansDoNotLogin();
         verifyTargetMismatchDoesNotLogin();
         verifyDescriptionAndWrongTaskStateDoNotLogin();
@@ -116,13 +117,31 @@ public final class StructureSyncExecutionCheck {
             "DELETE FROM " + TARGET_ONE + ";",
             "INSERT INTO " + TARGET_ONE + " VALUES (1);",
             "UPDATE " + TARGET_ONE + " SET A=1;",
-            "ALTER TABLE " + TARGET_ONE + " DROP COLUMN A;",
+            "ALTER TABLE " + TARGET_ONE + " DROP CONSTRAINT SOME_CONSTRAINT;",
+            "ALTER TABLE " + TARGET_ONE + " DROP PRIMARY KEY;",
+            "ALTER TABLE " + TARGET_ONE + " DROP COLUMN A, DROP COLUMN B;",
+            "ALTER TABLE " + TARGET_ONE + " DROP COLUMN A CASCADE CONSTRAINTS;",
             "ALTER TABLE " + TARGET_ONE + " RENAME TO renamed;",
             SCRIPT_ONE + "\nDROP TABLE " + TARGET_TWO + ";",
             "CREATE TABLE `unterminated (A INT);",
             "/* unterminated comment",
             "ALTER TABLE " + TARGET_ONE + " ADD COLUMN A VARCHAR(20) DEFAULT 'unterminated;")) {
             expectRejected(() -> StructureSyncScript.parseStatements(script), "不允许的脚本未被拒绝：" + script);
+        }
+    }
+
+    /** Params: 无。 Returns: 无；用户确认后的单列删除建议执行，其他删除操作仍拒绝。 */
+    private static void verifyDropColumnSuggestionsAreExecutable() throws Exception {
+        String script = "ALTER TABLE `" + TARGET_ONE + "` DROP COLUMN `EXTRA`;";
+        Fixture fixture = new Fixture();
+        MigrationTask task = failedTask(script, false);
+        new StructureSyncService(fixture::open).execute(task, request(task, targetConfig()));
+        assertEquals(SUCCEEDED, execution(task).get(STATUS_FIELD), "目标额外字段删除建议未执行");
+        assertEquals(SINGLE_CALL, fixture.statements.size(), "单列删除建议执行次数不正确");
+        for (String statement : Arrays.asList("ALTER TABLE \"" + TARGET_ONE + "\" DROP COLUMN \"EXTRA\";",
+            "ALTER TABLE `" + TARGET_ONE + "` DROP COLUMN `extra;part`;")) {
+            assertEquals(SINGLE_CALL, StructureSyncScript.parseStatements(statement).size(),
+                "方言引用或字段名内分号影响单列删除建议解析");
         }
     }
 

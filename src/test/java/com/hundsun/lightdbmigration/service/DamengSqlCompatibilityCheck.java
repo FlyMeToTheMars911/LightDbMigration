@@ -129,10 +129,13 @@ public class DamengSqlCompatibilityCheck {
         Class<?> columnClass = Class.forName(MigrationEngine.class.getName() + "$ColumnMeta");
         Object approximateColumn = migrationColumn(Types.DOUBLE, "DOUBLE");
         Object nationalLob = migrationColumn(Types.NCLOB, "NCLOB");
-        Method typeDefinition = method(MigrationEngine.class, "targetTypeDefinition", columnClass, String.class);
-        require("DOUBLE".equals(typeDefinition.invoke(migration, approximateColumn, MigrationConstants.DB_DM)),
+        Method typeDefinition = method(MigrationEngine.class, "targetTypeDefinition", columnClass, String.class,
+            String.class);
+        require("DOUBLE".equals(typeDefinition.invoke(migration, approximateColumn, MigrationConstants.DB_ORACLE,
+            MigrationConstants.DB_DM)),
             "DM floating-point script must use DOUBLE");
-        require("CLOB".equals(typeDefinition.invoke(migration, nationalLob, MigrationConstants.DB_DM)),
+        require("CLOB".equals(typeDefinition.invoke(migration, nationalLob, MigrationConstants.DB_ORACLE,
+            MigrationConstants.DB_DM)),
             "DM national LOB script must use CLOB");
         ArchiveEngine archive = new ArchiveEngine();
         Method qualified = method(ArchiveEngine.class, "quoteQualifiedName", QualifiedName.class, String.class);
@@ -390,9 +393,9 @@ public class DamengSqlCompatibilityCheck {
     }
 
     /**
-     * 检查仅达梦派生查询允许可空元数据差异，物理表同构与字段类型仍严格校验。
-     * @return 无返回值
-     * @throws Exception 检查失败
+     * 检查 Oracle/达梦派生查询可空元数据兼容，物理表同构与已知字段类型仍严格校验。
+     * Params: 无。
+     * Returns: 无；不符合数据库适配范围时抛出检查异常。
      */
     private static void verifyDerivedNullability() throws Exception {
         ArchiveEngine archive = new ArchiveEngine();
@@ -411,12 +414,13 @@ public class DamengSqlCompatibilityCheck {
         queryValidation.invoke(archive, nullableColumns, physicalColumns, "DM", MigrationConstants.DB_DM);
         require(rejects(queryValidation, archive, nullableColumns, physicalColumns, "MySQL",
             MigrationConstants.DB_MYSQL), "MySQL query nullability rule must remain strict");
-        require(rejects(queryValidation, archive, nullableColumns, physicalColumns, "Oracle",
-            MigrationConstants.DB_ORACLE), "Oracle query nullability rule must remain strict");
+        queryValidation.invoke(archive, nullableColumns, physicalColumns, "Oracle", MigrationConstants.DB_ORACLE);
         Method physicalValidation = method(ArchiveEngine.class, "validateSameStructure", List.class,
             List.class, String.class);
         require(rejects(physicalValidation, archive, physicalColumns, nullableColumns, "DM"),
             "physical source/target nullability must remain exact");
+        require(rejects(physicalValidation, archive, physicalColumns, nullableColumns, "Oracle"),
+            "Oracle physical source/target nullability must remain exact");
         List<Object> incompatible = Arrays.asList(
             constructor.newInstance(FIELD_NAME, Types.BIGINT, "INTEGER", 10, 0, DatabaseMetaData.columnNullable),
             constructor.newInstance(FIELD_NAME, Types.INTEGER, "NUMBER", 10, 0, DatabaseMetaData.columnNullable),

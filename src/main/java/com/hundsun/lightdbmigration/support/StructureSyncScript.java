@@ -12,7 +12,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * 对服务端结构建议做摘要及分句，只允许受支持的建表、增列和改列建议。
+ * 对服务端结构建议做摘要及分句，只允许受支持的建表和字段增改删建议。
  * Author: Codex
  * date: 2026-10-26
  */
@@ -40,6 +40,9 @@ public final class StructureSyncScript {
     private static final Pattern DDL_PREFIX = Pattern.compile("(?is)^\\s*(CREATE|ALTER)\\s+TABLE\\s+("
         + SIMPLE_NAME + "(?:\\s*\\.\\s*" + SIMPLE_NAME + ")?)\\s+(.*)$");
     private static final Pattern ALTER_COLUMNS = Pattern.compile("(?is)^(?:ADD|MODIFY)\\s+(?:COLUMN\\s+)?(.*)$");
+    /** 仅允许删除单个目标字段，不能借此删除表、约束或追加其他操作。 */
+    private static final Pattern DROP_COLUMN = Pattern.compile("(?is)^DROP\\s+COLUMN\\s+"
+        + "(?:[A-Za-z0-9_$#]+|`(?:``|[^`])+`|\"(?:\"\"|[^\"])+\")\\s*$");
     private static final Pattern UNSUPPORTED_ACTION = Pattern.compile(
         "(?i)\\b(?:DROP|TRUNCATE|DELETE|UPDATE|INSERT|MERGE|GRANT|REVOKE|RENAME|SELECT|CALL|EXECUTE|BEGIN|COMMIT|ROLLBACK)\\b");
     private static final Pattern NON_COLUMN_ADD = Pattern.compile(
@@ -139,21 +142,22 @@ public final class StructureSyncScript {
     public static QualifiedName targetTable(String statement) {
         Matcher prefix = DDL_PREFIX.matcher(statement);
         if (!prefix.matches()) {
-            throw new IllegalArgumentException("结构同步只允许当前建议中的 CREATE TABLE、ALTER TABLE ADD/MODIFY");
+            throw new IllegalArgumentException("结构同步只允许当前建议中的 CREATE TABLE、ALTER TABLE ADD/MODIFY/DROP COLUMN");
         }
         String operation = prefix.group(1).toUpperCase(Locale.ROOT);
         String body = prefix.group(3).trim();
+        boolean dropColumn = ALTER_OPERATION.equals(operation) && DROP_COLUMN.matcher(body).matches();
         if (CREATE_OPERATION.equals(operation)) {
             if (!body.startsWith(OPEN_PARENTHESIS)) {
                 throw new IllegalArgumentException("结构建议仅允许按列定义创建目标表");
             }
         } else if (ALTER_OPERATION.equals(operation)) {
             Matcher columns = ALTER_COLUMNS.matcher(body);
-            if (!columns.matches() || NON_COLUMN_ADD.matcher(columns.group(1)).matches()) {
-                throw new IllegalArgumentException("结构建议仅允许增加或修改目标字段");
+            if (!dropColumn && (!columns.matches() || NON_COLUMN_ADD.matcher(columns.group(1)).matches())) {
+                throw new IllegalArgumentException("结构建议仅允许增加、修改或删除单个目标字段");
             }
         }
-        if (UNSUPPORTED_ACTION.matcher(unquotedTokens(body)).find()) {
+        if (!dropColumn && UNSUPPORTED_ACTION.matcher(unquotedTokens(body)).find()) {
             throw new IllegalArgumentException("结构建议包含不支持的操作，请先人工处理");
         }
         String name = prefix.group(2).replace("`", "").replace("\"", "").replaceAll("\\s+", "");

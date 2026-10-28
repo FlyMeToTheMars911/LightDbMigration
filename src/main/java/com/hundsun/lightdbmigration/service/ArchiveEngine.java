@@ -555,8 +555,8 @@ public class ArchiveEngine {
     private List<ColumnMeta> readTableColumns(MigrationTask task, Connection connection, QualifiedName tableName,
         String databaseType) throws Exception {
         String sql = "SELECT * FROM " + quoteQualifiedName(tableName, databaseType) + " WHERE 1 = 0";
-        if (MigrationConstants.DB_DM.equals(databaseType)) {
-            return readColumnsForSql(task, connection, sql, true);
+        if (MigrationConstants.DB_DM.equals(databaseType) || MigrationConstants.DB_ORACLE.equals(databaseType)) {
+            return readColumnsForSql(task, connection, sql, MigrationConstants.DB_DM.equals(databaseType));
         }
         return readQueryColumns(task, connection, sql);
     }
@@ -716,7 +716,7 @@ public class ArchiveEngine {
     }
 
     /**
-     * 校验归档查询覆盖源表字段；达梦派生查询可能将物理非空列报告为可空。
+     * 校验归档查询覆盖源表字段，统一处理 Oracle/达梦派生查询中不可靠的精度和可空元数据。
      * Params: queryColumns 查询字段；sourceColumns 物理源表字段；displayName 节点名；databaseType 数据库类型。
      * Returns: 无；类型、精度或字段集合不一致时拒绝归档，物理表同构仍单独严格校验。
      */
@@ -732,8 +732,10 @@ public class ArchiveEngine {
                 throw new IllegalArgumentException(displayName + "归档查询返回了非源表字段或字段别名："
                     + queryColumn.name);
             }
-            boolean sameDefinition = MigrationConstants.DB_DM.equals(databaseType)
-                ? sameColumnTypeDefinition(queryColumn, sourceColumn) : sameColumnDefinition(queryColumn, sourceColumn);
+            boolean sameDefinition = ArchiveQueryMetadataSupport.matches(databaseType,
+                queryColumn.jdbcType, queryColumn.typeName, queryColumn.precision, queryColumn.scale,
+                queryColumn.nullable, sourceColumn.jdbcType, sourceColumn.typeName, sourceColumn.precision,
+                sourceColumn.scale, sourceColumn.nullable);
             if (!sameDefinition) {
                 throw new IllegalArgumentException(displayName + "归档查询字段类型与源表不同：" + queryColumn.name
                     + "，归档查询=" + queryColumn.describe() + "，源表=" + sourceColumn.describe());

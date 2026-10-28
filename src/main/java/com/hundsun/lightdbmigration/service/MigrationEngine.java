@@ -20,6 +20,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Types;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -58,6 +59,7 @@ public class MigrationEngine {
     private static final String TYPE_INTEGER = "INTEGER";
     private static final String TYPE_INT = "INT";
     private static final String TYPE_BIGINT = "BIGINT";
+    private static final String TYPE_FLOAT = "FLOAT";
     private static final String SCRIPT_LINE_BREAK = "\n";
     private static final String MYSQL_TABLE_NOT_FOUND_STATE = "42S02";
     private static final String SQLSTATE_CONNECTION_PREFIX = "08";
@@ -68,6 +70,14 @@ public class MigrationEngine {
     private static final int MYSQL_MAX_DECIMAL_SCALE = 30;
     private static final int ORACLE_MAX_NUMBER_PRECISION = 38;
     private static final int MYSQL_SUGGESTED_VARCHAR_LIMIT = 4000;
+    private static final int MYSQL_MAX_CHAR_LENGTH = 255;
+    private static final int MYSQL_MAX_FLOAT_DISPLAY_WIDTH = 255;
+    private static final Set<String> INCOMPLETE_NATIVE_TYPES = new LinkedHashSet<>(Arrays.asList(
+        "ENUM", "SET", "UNKNOWN", "OTHER", "NULL"));
+    /** 截取原生类型参数前的类型名。 */
+    private static final String NATIVE_TYPE_PARAMETER_PATTERN = "\\(.*$";
+    /** 可以完整还原的原生数字精度定义。 */
+    private static final String NATIVE_DECIMAL_TYPE_PATTERN = "(?:DEC|DECIMAL|NUMERIC|NUMBER)\\([0-9]+(?:, *-?[0-9]+)?\\)";
     private static final int ORACLE_MAX_VARCHAR_LENGTH = 4000;
     private static final int ORACLE_MAX_NVARCHAR_LENGTH = 2000;
     private static final BigDecimal BOOLEAN_MIN = BigDecimal.ZERO;
@@ -321,7 +331,7 @@ public class MigrationEngine {
         }
         if (sourceColumns != null && allTargetColumns == null
             && isMissingTable(targetMetadataException, targetType)) {
-            addCreateTableStatement(synchronizationStatements, targetName, sourceColumns, targetType);
+            addCreateTableStatement(synchronizationStatements, targetName, sourceColumns, sourceType, targetType);
         }
         if (sourceColumns == null || allTargetColumns == null) {
             return null;
@@ -339,13 +349,15 @@ public class MigrationEngine {
         Set<String> selectedNames = new LinkedHashSet<>();
         for (ColumnMeta sourceColumn : sourceColumns) {
             String normalizedName = normalizeName(sourceColumn.name);
+            registerColumnExpectation(synchronizationStatements, targetName, sourceColumn, sourceType, targetType, true);
             ColumnMeta targetColumn = targetColumnMap.get(normalizedName);
             if (targetColumn == null) {
                 addValidationIssue(validationIssues, stepLabel, "源查询字段 " + sourceColumn.name
                     + " 在目标表 " + targetName.toSql() + " 中不存在");
-                addColumnStatement(synchronizationStatements, targetName, sourceColumn, targetType);
+                addColumnStatement(synchronizationStatements, targetName, sourceColumn, sourceType, targetType);
                 continue;
             }
+            String compatibilityIssue = null;
             try {
                 NumericRangeCheck numericRangeCheck = validateTypeCompatibility(sourceColumn, targetColumn,
                     targetName.toSql());
@@ -353,23 +365,32 @@ public class MigrationEngine {
                     numericRangeChecks.add(numericRangeCheck);
                 }
             } catch (IllegalArgumentException exception) {
-                addValidationIssue(validationIssues, stepLabel, SqlSupport.safeMessage(exception));
-                addModifyColumnStatement(synchronizationStatements, targetName, sourceColumn, targetColumn, targetType);
+                compatibilityIssue = SqlSupport.safeMessage(exception);
+            }
+            String expectedType = targetTypeDefinition(sourceColumn, sourceType, targetType);
+            String actualType = targetTypeDefinition(targetColumn, targetType, targetType);
+            boolean unknownNullable = sourceNullableClause(sourceColumn) == null;
+            if (expectedType == null || !expectedType.equals(actualType)
+                || sourceColumn.nullable != targetColumn.nullable || unknownNullable) {
+                String issue = compatibilityIssue == null ? "字段定义不同：" + sourceColumn.name : compatibilityIssue;
+                addValidationIssue(validationIssues, stepLabel, issue + "；源查询映射="
+                    + (expectedType == null ? "类型无法可靠映射" : expectedType)
+                    + " " + nullableDescription(sourceColumn) + "，目标="
+                    + (actualType == null ? targetColumn.typeName : actualType) + " " + nullableDescription(targetColumn));
+                addModifyColumnStatement(synchronizationStatements, targetName, sourceColumn, targetColumn,
+                    sourceType, targetType);
             }
             selectedTargetColumns.add(targetColumn);
             selectedNames.add(normalizedName);
         }
 
-        try {
-            validateRequiredTargetColumns(task, targetConnection, targetName, targetType, allTargetColumns,
-                selectedNames, validationIssues, stepLabel);
-        } catch (Exception exception) {
-            throwIfControlRequested(task);
-            if (isConnectionFailure(exception)) {
-                throw exception;
+        for (ColumnMeta targetColumn : allTargetColumns) {
+            if (!selectedNames.contains(normalizeName(targetColumn.name))) {
+                addValidationIssue(validationIssues, stepLabel, "目标表 " + targetName.toSql()
+                    + " 存在源查询没有的字段：" + targetColumn.name);
+                registerColumnExpectation(synchronizationStatements, targetName, targetColumn, sourceType, targetType, false);
+                addDropColumnStatement(synchronizationStatements, targetName, targetColumn, targetType);
             }
-            addValidationIssue(validationIssues, stepLabel,
-                "目标表必填字段规则读取失败：" + SqlSupport.safeMessage(exception));
         }
         int cursorIndex = -1;
         try {
@@ -453,8 +474,10 @@ public class MigrationEngine {
             .append("-- 目标数据库类型：").append(targetType).append(SCRIPT_LINE_BREAK)
             .append("-- 重要：本脚本仅根据源查询结果元数据生成，工具不会未经确认执行；点击执行脚本并再次确认后执行。")
             .append(SCRIPT_LINE_BREAK)
-            .append("-- 执行前必须备份目标表，并由开发/DBA 核对主键、索引、默认值、非空约束、")
-            .append("字符集、排序规则和字段注释。").append(SCRIPT_LINE_BREAK)
+            .append("-- 字段集合、映射后的类型/长度/精度及可空性以源查询为准；多余字段会删除。")
+            .append(SCRIPT_LINE_BREAK)
+            .append("-- 主键、索引、默认值、自增、字符集和注释不在本次字段比对范围；DDL 可能受现有数据或约束影响。")
+            .append(SCRIPT_LINE_BREAK)
             .append(SCRIPT_LINE_BREAK)
             .append("-- 本次校验问题").append(SCRIPT_LINE_BREAK);
         int issueNumber = 1;
@@ -476,6 +499,11 @@ public class MigrationEngine {
 
     private void addCreateTableStatement(Set<String> statements, QualifiedName targetName,
         List<ColumnMeta> sourceColumns, String targetType) {
+        addCreateTableStatement(statements, targetName, sourceColumns, targetType, targetType);
+    }
+
+    private void addCreateTableStatement(Set<String> statements, QualifiedName targetName,
+        List<ColumnMeta> sourceColumns, String sourceType, String targetType) {
         Set<String> columnNames = new LinkedHashSet<>();
         List<String> definitions = new ArrayList<>();
         for (ColumnMeta sourceColumn : sourceColumns) {
@@ -491,15 +519,17 @@ public class MigrationEngine {
                     + sanitizeScriptComment(sourceColumn.name) + "，请先修改查询别名。");
                 return;
             }
-            String typeDefinition = targetTypeDefinition(sourceColumn, targetType);
-            if (typeDefinition == null) {
+            String typeDefinition = targetTypeDefinition(sourceColumn, sourceType, targetType);
+            String nullable = sourceNullableClause(sourceColumn);
+            if (typeDefinition == null || nullable == null) {
                 statements.add("-- 未生成 " + quotedQualifiedName(targetName, targetType)
                     + " 的 CREATE TABLE：字段 " + sanitizeScriptComment(sourceColumn.name)
-                    + " 的源类型 " + sanitizeScriptComment(sourceColumn.typeName) + " 无法安全映射，请人工定义。");
+                    + " 的源类型或可空性无法可靠映射：" + sanitizeScriptComment(sourceColumn.typeName)
+                    + " " + nullableDescription(sourceColumn) + "。");
                 return;
             }
             definitions.add("    " + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition
-                + " NULL");
+                + nullable);
         }
         addStructureStatement(statements, targetName, null, targetType,
             "-- 已确认目标表确实不存在后再执行；主键、索引和注释需要另行补充。"
@@ -510,59 +540,86 @@ public class MigrationEngine {
 
     private void addColumnStatement(Set<String> statements, QualifiedName targetName, ColumnMeta sourceColumn,
         String targetType) {
+        addColumnStatement(statements, targetName, sourceColumn, targetType, targetType);
+    }
+
+    private void addColumnStatement(Set<String> statements, QualifiedName targetName, ColumnMeta sourceColumn,
+        String sourceType, String targetType) {
         if (!canGenerateColumnStatement(statements, targetName, sourceColumn, targetType)) {
             return;
         }
-        String typeDefinition = targetTypeDefinition(sourceColumn, targetType);
-        if (typeDefinition == null) {
+        String typeDefinition = targetTypeDefinition(sourceColumn, sourceType, targetType);
+        String nullable = sourceNullableClause(sourceColumn);
+        if (typeDefinition == null || nullable == null) {
             statements.add("-- 目标表 " + quotedQualifiedName(targetName, targetType) + " 缺少字段 "
                 + sanitizeScriptComment(quotedColumnName(sourceColumn.name, targetType)) + "，但源类型 "
-                + sanitizeScriptComment(sourceColumn.typeName) + " 无法安全映射，请人工补充。");
+                + sanitizeScriptComment(sourceColumn.typeName) + " 或可空性（" + nullableDescription(sourceColumn)
+                + "）无法可靠映射，未生成该字段 DDL。");
             return;
         }
         if (MigrationConstants.DB_MYSQL.equals(targetType)) {
             addStructureStatement(statements, targetName, sourceColumn.name, targetType,
                 "ALTER TABLE " + quotedQualifiedName(targetName, targetType) + " ADD COLUMN "
-                + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition + " NULL;");
+                + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition + nullable + ";");
         } else {
             addStructureStatement(statements, targetName, sourceColumn.name, targetType,
                 "ALTER TABLE " + quotedQualifiedName(targetName, targetType) + " ADD ("
-                + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition + " NULL);");
+                + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition + nullable + ");");
         }
     }
 
     private void addModifyColumnStatement(Set<String> statements, QualifiedName targetName, ColumnMeta sourceColumn,
         ColumnMeta targetColumn, String targetType) {
+        addModifyColumnStatement(statements, targetName, sourceColumn, targetColumn, targetType, targetType);
+    }
+
+    private void addModifyColumnStatement(Set<String> statements, QualifiedName targetName, ColumnMeta sourceColumn,
+        ColumnMeta targetColumn, String sourceType, String targetType) {
         if (!canGenerateColumnStatement(statements, targetName, sourceColumn, targetType)) {
             return;
         }
-        String typeDefinition = targetTypeDefinition(sourceColumn, targetType);
-        if (typeDefinition == null) {
+        String typeDefinition = targetTypeDefinition(sourceColumn, sourceType, targetType);
+        String nullableClause = sourceNullableClause(sourceColumn);
+        if (typeDefinition == null || nullableClause == null) {
             statements.add("-- 目标表 " + quotedQualifiedName(targetName, targetType) + " 的字段 "
                 + quotedColumnName(sourceColumn.name, targetType) + " 需要调整，但源类型 "
-                + sanitizeScriptComment(sourceColumn.typeName) + " 无法安全映射，请人工处理。");
+                + sanitizeScriptComment(sourceColumn.typeName) + " 或可空性（" + nullableDescription(sourceColumn)
+                + "）无法可靠映射，未生成该字段 DDL。");
             return;
         }
         if (MigrationConstants.DB_MYSQL.equals(targetType)) {
-            if (targetColumn == null || (targetColumn.nullable != DatabaseMetaData.columnNoNulls
-                && targetColumn.nullable != DatabaseMetaData.columnNullable)) {
-                statements.add("-- 目标表 " + quotedQualifiedName(targetName, targetType) + " 的字段 "
-                    + quotedColumnName(sourceColumn.name, targetType)
-                    + " 原有可空约束未知，无法安全生成 MODIFY；请人工保留原非空约束及其他字段属性后调整类型。");
-                return;
-            }
-            String nullableClause = targetColumn.nullable == DatabaseMetaData.columnNoNulls ? " NOT NULL" : "";
             addStructureStatement(statements, targetName, sourceColumn.name, targetType,
-                "-- MySQL MODIFY COLUMN 已保留目标非空规则，仍可能覆盖原 DEFAULT、COMMENT、自增和字符集等属性，"
-                + "执行前请用 SHOW CREATE TABLE 补齐。"
-                + SCRIPT_LINE_BREAK + "ALTER TABLE " + quotedQualifiedName(targetName, targetType)
+                "ALTER TABLE " + quotedQualifiedName(targetName, targetType)
                 + " MODIFY COLUMN " + quotedColumnName(sourceColumn.name, targetType) + " "
                 + typeDefinition + nullableClause + ";");
         } else {
+            if (targetColumn != null && sourceColumn.nullable == targetColumn.nullable) {
+                nullableClause = "";
+            }
             addStructureStatement(statements, targetName, sourceColumn.name, targetType,
                 "ALTER TABLE " + quotedQualifiedName(targetName, targetType) + " MODIFY ("
-                + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition + ");");
+                + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition + nullableClause + ");");
         }
+    }
+
+    private void addDropColumnStatement(Set<String> statements, QualifiedName table, ColumnMeta column, String targetType) {
+        if (canGenerateColumnStatement(statements, table, column, targetType)) {
+            addStructureStatement(statements, table, column.name, targetType,
+                "ALTER TABLE " + quotedQualifiedName(table, targetType) + " DROP COLUMN "
+                    + quotedColumnName(column.name, targetType) + ";");
+        }
+    }
+
+    private String sourceNullableClause(ColumnMeta column) {
+        if (column.nullable == DatabaseMetaData.columnNoNulls) {
+            return " NOT NULL";
+        }
+        return column.nullable == DatabaseMetaData.columnNullable ? " NULL" : null;
+    }
+
+    private String nullableDescription(ColumnMeta column) {
+        String clause = sourceNullableClause(column);
+        return clause == null ? "可空性未知，不能推断 NULL/NOT NULL" : clause.trim();
     }
 
     private boolean canGenerateColumnStatement(Set<String> statements, QualifiedName targetName,
@@ -584,12 +641,7 @@ public class MigrationEngine {
                     + "以下 DDL 仅供人工核对：" + sanitizeScriptComment(statement));
                 return;
             }
-            String namespace = table.getSchema() == null ? suggestions.namespace : table.getSchema();
-            String canonicalTable = SqlSupport.quoteIdentifier(scriptIdentifier(table.getTable(), targetType), targetType);
-            if (namespace != null) {
-                canonicalTable = SqlSupport.quoteIdentifier(scriptIdentifier(namespace, targetType), targetType)
-                    + "." + canonicalTable;
-            }
+            String canonicalTable = canonicalStructureTable(suggestions, table, targetType);
             String objectName = canonicalTable + (columnName == null ? ""
                 : "." + quotedColumnName(normalizeName(columnName), targetType));
             String quotedTable = quotedQualifiedName(table, targetType);
@@ -598,6 +650,25 @@ public class MigrationEngine {
             suggestions.addProposal(objectName, definition, statement);
         } else {
             statements.add(statement);
+        }
+    }
+
+    private String canonicalStructureTable(StructureStatements suggestions, QualifiedName table, String targetType) {
+        String namespace = table.getSchema() == null ? suggestions.namespace : table.getSchema();
+        String canonicalTable = SqlSupport.quoteIdentifier(scriptIdentifier(table.getTable(), targetType), targetType);
+        return namespace == null ? canonicalTable
+            : SqlSupport.quoteIdentifier(scriptIdentifier(namespace, targetType), targetType) + "." + canonicalTable;
+    }
+
+    private void registerColumnExpectation(Set<String> statements, QualifiedName table, ColumnMeta column,
+        String sourceType, String targetType, boolean present) {
+        if (statements instanceof StructureStatements && isSafeScriptIdentifier(column.name)) {
+            StructureStatements suggestions = (StructureStatements)statements;
+            String objectName = canonicalStructureTable(suggestions, table, targetType) + "."
+                + quotedColumnName(normalizeName(column.name), targetType);
+            String definition = present ? targetTypeDefinition(column, sourceType, targetType)
+                + " " + nullableDescription(column) : "DROP COLUMN";
+            suggestions.expectColumn(objectName, definition);
         }
     }
 
@@ -617,13 +688,25 @@ public class MigrationEngine {
     }
 
     private String targetTypeDefinition(ColumnMeta sourceColumn, String targetType) {
+        return targetTypeDefinition(sourceColumn, targetType, targetType);
+    }
+
+    private String targetTypeDefinition(ColumnMeta sourceColumn, String sourceType, String targetType) {
+        if (targetType.equals(sourceType)) {
+            return nativeTypeDefinition(sourceColumn, targetType);
+        }
         int sourceGroup = typeGroup(sourceColumn.jdbcType);
         if (sourceGroup == TypeGroup.NUMBER) {
             if (isApproximateNumeric(sourceColumn.jdbcType)) {
-                return MigrationConstants.DB_ORACLE.equals(targetType) ? "BINARY_DOUBLE" : "DOUBLE";
+                boolean singlePrecision = sourceColumn.jdbcType == Types.REAL || sourceColumn.jdbcType == Types.FLOAT;
+                return MigrationConstants.DB_ORACLE.equals(targetType)
+                    ? (singlePrecision ? "BINARY_FLOAT" : "BINARY_DOUBLE") : (singlePrecision ? "FLOAT" : "DOUBLE");
             }
             if (sourceColumn.jdbcType == Types.BOOLEAN) {
-                return MigrationConstants.DB_MYSQL.equals(targetType) ? "TINYINT(1)" : "NUMBER(1,0)";
+                if (MigrationConstants.DB_MYSQL.equals(targetType)) {
+                    return "TINYINT";
+                }
+                return MigrationConstants.DB_DM.equals(targetType) ? "DECIMAL(1,0)" : "NUMBER(1,0)";
             }
             if (sourceColumn.jdbcType == Types.BIT && MigrationConstants.DB_MYSQL.equals(targetType)) {
                 int precision = sourceColumn.precision > UNKNOWN_PRECISION
@@ -645,7 +728,8 @@ public class MigrationEngine {
             if (precision > ORACLE_MAX_NUMBER_PRECISION) {
                 return null;
             }
-            return "NUMBER(" + precision + "," + scale + ")";
+            return (MigrationConstants.DB_DM.equals(targetType) ? "DECIMAL(" : "NUMBER(")
+                + precision + "," + scale + ")";
         }
         if (sourceGroup == TypeGroup.TEXT) {
             boolean nationalText = sourceColumn.jdbcType == Types.NCHAR || sourceColumn.jdbcType == Types.NVARCHAR
@@ -653,37 +737,163 @@ public class MigrationEngine {
             boolean longText = sourceColumn.jdbcType == Types.LONGVARCHAR
                 || sourceColumn.jdbcType == Types.LONGNVARCHAR || sourceColumn.jdbcType == Types.CLOB
                 || sourceColumn.jdbcType == Types.NCLOB || sourceColumn.precision <= UNKNOWN_PRECISION;
+            boolean fixedText = sourceColumn.jdbcType == Types.CHAR || sourceColumn.jdbcType == Types.NCHAR;
             if (MigrationConstants.DB_MYSQL.equals(targetType)) {
                 return longText || sourceColumn.precision > MYSQL_SUGGESTED_VARCHAR_LIMIT
-                    ? "LONGTEXT" : "VARCHAR(" + sourceColumn.precision + ")";
+                    ? "LONGTEXT" : (fixedText && sourceColumn.precision <= MYSQL_MAX_CHAR_LENGTH ? "CHAR(" : "VARCHAR(")
+                        + sourceColumn.precision + ")";
             }
             if (nationalText && MigrationConstants.DB_ORACLE.equals(targetType)) {
                 return longText || sourceColumn.precision > ORACLE_MAX_NVARCHAR_LENGTH
-                    ? "NCLOB" : "NVARCHAR2(" + sourceColumn.precision + ")";
+                    ? "NCLOB" : (fixedText ? "NCHAR(" : "NVARCHAR2(") + sourceColumn.precision + ")";
+            }
+            if (MigrationConstants.DB_DM.equals(targetType)) {
+                return longText || sourceColumn.precision > ORACLE_MAX_VARCHAR_LENGTH ? "CLOB"
+                    : (fixedText ? "CHAR(" : (nationalText ? "NVARCHAR(" : "VARCHAR("))
+                        + sourceColumn.precision + ")";
             }
             return longText || sourceColumn.precision > ORACLE_MAX_VARCHAR_LENGTH
-                ? "CLOB" : "VARCHAR2(" + sourceColumn.precision + " CHAR)";
+                ? "CLOB" : (fixedText ? "CHAR(" : "VARCHAR2(") + sourceColumn.precision + " CHAR)";
         }
         if (sourceGroup == TypeGroup.TIME) {
+            int fractionScale = Math.max(INTEGER_SCALE, sourceColumn.scale);
+            int mysqlFractionScale = Math.min(6, fractionScale);
             if (MigrationConstants.DB_MYSQL.equals(targetType)) {
                 if (sourceColumn.jdbcType == Types.DATE) {
                     return "DATE";
                 }
                 if (sourceColumn.jdbcType == Types.TIME || sourceColumn.jdbcType == JDBC_TIME_WITH_TIMEZONE) {
-                    return "TIME(6)";
+                    return "TIME(" + mysqlFractionScale + ")";
                 }
-                return "DATETIME(6)";
+                return "DATETIME(" + mysqlFractionScale + ")";
             }
             if (MigrationConstants.DB_DM.equals(targetType)
                 && (sourceColumn.jdbcType == Types.TIME || sourceColumn.jdbcType == JDBC_TIME_WITH_TIMEZONE)) {
-                return "TIME(6)";
+                return "TIME(" + fractionScale + ")";
             }
-            return sourceColumn.jdbcType == Types.DATE ? "DATE" : "TIMESTAMP(6)";
+            return sourceColumn.jdbcType == Types.DATE ? "DATE" : "TIMESTAMP(" + fractionScale + ")";
         }
         if (sourceGroup == TypeGroup.BINARY) {
             return MigrationConstants.DB_MYSQL.equals(targetType) ? "LONGBLOB" : "BLOB";
         }
         return null;
+    }
+
+    private String nativeTypeDefinition(ColumnMeta column, String databaseType) {
+        String type = column.typeName == null ? "" : column.typeName.trim().toUpperCase(Locale.ROOT);
+        boolean unsigned = type.endsWith(" " + UNSIGNED_TYPE_MARKER);
+        String suffix = unsigned ? " " + UNSIGNED_TYPE_MARKER : "";
+        if (unsigned) {
+            type = type.substring(0, type.length() - suffix.length());
+        }
+        if (!isSafeScriptIdentifier(type) || INCOMPLETE_NATIVE_TYPES.contains(type.replaceAll(NATIVE_TYPE_PARAMETER_PATTERN, ""))) {
+            return null;
+        }
+        if (type.matches(NATIVE_DECIMAL_TYPE_PATTERN)) {
+            String[] parameters = type.substring(type.indexOf('(') + 1, type.length() - 1).split(",");
+            return (MigrationConstants.DB_ORACLE.equals(databaseType) ? "NUMBER(" : "DECIMAL(")
+                + parameters[0].trim() + "," + (parameters.length > 1 ? parameters[1].trim() : "0") + ")" + suffix;
+        }
+        switch (type) {
+            case "INT":
+            case "INTEGER":
+                return "INT" + suffix;
+            case "BOOL":
+            case "BOOLEAN":
+                return MigrationConstants.DB_MYSQL.equals(databaseType) ? "TINYINT" : "BOOLEAN";
+            case "DEC":
+            case "DECIMAL":
+            case "NUMERIC":
+            case "NUMBER":
+                String numericType = MigrationConstants.DB_ORACLE.equals(databaseType) ? "NUMBER" : "DECIMAL";
+                if (column.precision <= UNKNOWN_PRECISION) {
+                    return MigrationConstants.DB_ORACLE.equals(databaseType) ? "NUMBER" : null;
+                }
+                return numericType + "(" + column.precision + "," + column.scale + ")" + suffix;
+            case "VARCHAR":
+            case "VARCHAR2":
+            case "NVARCHAR":
+            case "NVARCHAR2":
+            case "CHAR":
+            case "NCHAR":
+            case "BINARY":
+            case "VARBINARY":
+            case "RAW":
+            case "UROWID":
+                if (column.precision <= UNKNOWN_PRECISION) {
+                    return null;
+                }
+                boolean oracleText = MigrationConstants.DB_ORACLE.equals(databaseType);
+                if (oracleText && (Types.VARCHAR == column.jdbcType || Types.CHAR == column.jdbcType)) {
+                    return (column.jdbcType == Types.CHAR ? "CHAR(" : "VARCHAR2(") + column.precision + " CHAR)";
+                }
+                if (oracleText && (Types.NVARCHAR == column.jdbcType || Types.NCHAR == column.jdbcType)) {
+                    return (column.jdbcType == Types.NCHAR ? "NCHAR(" : "NVARCHAR2(") + column.precision + ")";
+                }
+                return type + "(" + column.precision + ")";
+            case "BIT":
+                return MigrationConstants.DB_MYSQL.equals(databaseType)
+                    ? "BIT(" + (column.precision > UNKNOWN_PRECISION ? column.precision : DEFAULT_BIT_PRECISION) + ")"
+                    : "BIT";
+            case "TIME":
+            case "DATETIME":
+            case "TIMESTAMP":
+            case "TIMESTAMP WITH TIME ZONE":
+            case "TIMESTAMP WITH LOCAL TIME ZONE":
+                if (column.scale < INTEGER_SCALE) {
+                    return null;
+                }
+                int zoneIndex = type.indexOf(" WITH ");
+                return zoneIndex < INTEGER_SCALE ? type + "(" + column.scale + ")"
+                    : type.substring(0, zoneIndex) + "(" + column.scale + ")" + type.substring(zoneIndex);
+            case "TINYINT":
+            case "SMALLINT":
+            case "MEDIUMINT":
+            case "BIGINT":
+                return type + suffix;
+            case "FLOAT":
+            case "REAL":
+            case "DOUBLE":
+            case "DOUBLE PRECISION":
+                if (MigrationConstants.DB_ORACLE.equals(databaseType) && TYPE_FLOAT.equals(type)
+                    && column.precision > UNKNOWN_PRECISION) {
+                    return "FLOAT(" + column.precision + ")";
+                }
+                if (MigrationConstants.DB_MYSQL.equals(databaseType) && column.scale > INTEGER_SCALE
+                    && column.scale <= MYSQL_MAX_DECIMAL_SCALE && column.scale <= column.precision
+                    && column.precision > UNKNOWN_PRECISION && column.precision <= MYSQL_MAX_FLOAT_DISPLAY_WIDTH) {
+                    return type + "(" + column.precision + "," + column.scale + ")" + suffix;
+                }
+                return type + suffix;
+            case "BINARY_FLOAT":
+            case "BINARY_DOUBLE":
+            case "DATE":
+            case "TEXT":
+            case "TINYTEXT":
+            case "MEDIUMTEXT":
+            case "LONGTEXT":
+            case "BLOB":
+            case "TINYBLOB":
+            case "MEDIUMBLOB":
+            case "LONGBLOB":
+            case "CLOB":
+            case "NCLOB":
+            case "LONG":
+            case "LONG RAW":
+            case "JSON":
+                return type + suffix;
+            case "ENUM":
+            case "SET":
+            case "UNKNOWN":
+            case "OTHER":
+            case "NULL":
+                return null;
+            default:
+                boolean namedType = type.matches("[A-Z][A-Z0-9_$#]*(?:\\.[A-Z][A-Z0-9_$#]*)?(?:\\([0-9]+(?:, *-?[0-9]+)?\\))?");
+                boolean textWithSemantics = type.matches("(?:CHAR|VARCHAR|VARCHAR2|NCHAR|NVARCHAR2)\\([0-9]+ (?:CHAR|BYTE)\\)");
+                boolean timestampWithZone = type.matches("TIMESTAMP\\([0-9]+\\)(?: WITH (?:LOCAL )?TIME ZONE)?");
+                return namedType || textWithSemantics || timestampWithZone ? type + suffix : null;
+        }
     }
 
     private String quotedQualifiedName(QualifiedName targetName, String targetType) {
@@ -863,49 +1073,6 @@ public class MigrationEngine {
         return null;
     }
 
-    private void validateRequiredTargetColumns(MigrationTask task, Connection connection, QualifiedName targetName,
-        String targetType, List<ColumnMeta> allTargetColumns, Set<String> selectedNames,
-        Set<String> validationIssues, String stepLabel) throws SQLException {
-        Map<String, TargetColumnRule> rules = loadTargetColumnRules(connection, targetName, targetType);
-        if (rules.isEmpty()) {
-            task.warn("未能读取目标表 " + targetName.toSql() + " 的默认值元数据，仅校验查询返回字段");
-            return;
-        }
-        for (ColumnMeta column : allTargetColumns) {
-            if (selectedNames.contains(normalizeName(column.name))) {
-                continue;
-            }
-            TargetColumnRule rule = rules.get(normalizeName(column.name));
-            if (rule != null && !rule.nullable && !rule.autoIncrement && !rule.hasDefault) {
-                addValidationIssue(validationIssues, stepLabel, "目标表必填字段 " + column.name
-                    + " 未包含在源查询结果中，且没有默认值；请补充源查询字段或人工核对目标默认值/非空约束，"
-                    + "未自动生成放宽约束的 DDL");
-            }
-        }
-    }
-
-    private Map<String, TargetColumnRule> loadTargetColumnRules(Connection connection, QualifiedName targetName,
-        String targetType) throws SQLException {
-        MetadataLocation location = resolveMetadataLocation(connection, targetName, targetType);
-        DatabaseMetaData metaData = connection.getMetaData();
-        Map<String, TargetColumnRule> result = new HashMap<>();
-        for (String tableCandidate : tableCandidates(targetName.getTable())) {
-            try (ResultSet columns = metaData.getColumns(location.catalog, location.schema, tableCandidate, null)) {
-                while (columns.next()) {
-                    String name = columns.getString("COLUMN_NAME");
-                    boolean nullable = columns.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls;
-                    String defaultValue = columns.getString("COLUMN_DEF");
-                    boolean autoIncrement = "YES".equalsIgnoreCase(getOptionalString(columns, "IS_AUTOINCREMENT"));
-                    result.put(normalizeName(name), new TargetColumnRule(nullable, autoIncrement, defaultValue != null));
-                }
-            }
-            if (!result.isEmpty()) {
-                break;
-            }
-        }
-        return result;
-    }
-
     private int resolveCursorIndex(String cursorColumn, List<ColumnMeta> sourceColumns) {
         if (isBlank(cursorColumn)) {
             return -1;
@@ -993,7 +1160,7 @@ public class MigrationEngine {
                     } catch (IllegalArgumentException exception) {
                         addValidationIssue(validationIssues, stepLabel, SqlSupport.safeMessage(exception));
                         addModifyColumnStatement(synchronizationStatements, targetName, rangeCheck.source,
-                            rangeCheck.target, targetType);
+                            rangeCheck.target, sourceType, targetType);
                     }
                 }
                 return totalRows;
@@ -1678,6 +1845,7 @@ public class MigrationEngine {
         private static final long serialVersionUID = 1L;
         private final Map<String, String> proposals = new LinkedHashMap<>();
         private final Map<String, String> definitions = new LinkedHashMap<>();
+        private final Map<String, String> expectations = new LinkedHashMap<>();
         private final Set<String> conflictingObjects = new LinkedHashSet<>();
         private final String namespace;
         private final Set<String> ambiguousTables;
@@ -1689,6 +1857,21 @@ public class MigrationEngine {
         private StructureStatements(String namespace, Set<String> ambiguousTables) {
             this.namespace = namespace;
             this.ambiguousTables = ambiguousTables;
+        }
+
+        private void expectColumn(String objectName, String definition) {
+            String previous = expectations.putIfAbsent(objectName, definition);
+            if (previous != null && !previous.equals(definition)) {
+                String statement = proposals.get(objectName);
+                if (statement != null) {
+                    remove(statement);
+                    add("-- 冲突候选建议（仅供人工参考）：" + sanitizeScriptComment(statement));
+                }
+                conflictingObjects.add(objectName);
+                add("-- 目标对象 " + sanitizeScriptComment(objectName)
+                    + " 存在冲突的源字段定义：" + sanitizeScriptComment(previous) + " / "
+                    + sanitizeScriptComment(definition) + "；已取消该对象的可执行 DDL。");
+            }
         }
 
         private void addProposal(String objectName, String definition, String statement) {
@@ -1759,18 +1942,6 @@ public class MigrationEngine {
             this.scale = scale;
             this.nullable = nullable;
             this.autoIncrement = autoIncrement;
-        }
-    }
-
-    private static final class TargetColumnRule {
-        private final boolean nullable;
-        private final boolean autoIncrement;
-        private final boolean hasDefault;
-
-        private TargetColumnRule(boolean nullable, boolean autoIncrement, boolean hasDefault) {
-            this.nullable = nullable;
-            this.autoIncrement = autoIncrement;
-            this.hasDefault = hasDefault;
         }
     }
 
