@@ -22,7 +22,23 @@
 
 ## 开发打包
 
-项目使用 Maven 管理依赖，打包环境要求 JDK 8 和 Maven 3.6.3 及以上版本。开发人员执行一次命令即可同时生成可执行 Jar 和现场交付 ZIP：
+项目使用 Maven 管理依赖，打包环境要求 JDK 8 和 Maven 3.6.3 及以上版本，并将 Maven 加入 `PATH`。开发人员在源码目录执行对应平台脚本，即可同时生成可执行 Jar 和现场交付 ZIP：
+
+```text
+build.bat
+sh build.sh
+```
+
+脚本自动定位项目目录，分别调用 `PATH` 中的 `mvn.cmd`、`mvn`，执行 `-B clean package -DskipTests`，并原样传递全部命令行 Maven 参数。可从其他目录通过脚本路径启动；脚本不暂停等待按键。失败时返回 Maven 原始退出码，不显示打包成功提示。使用 `build.bat --help` 或 `sh build.sh --help` 查看帮助，无需安装 Maven；也支持 `-h`，Windows 另支持 `/?`。
+
+可附加离线参数或指定包含空格的目标 Java 目录：
+
+```text
+build.bat "-Dbundled.java.home=D:\delivery\jdk 8" -o
+sh build.sh "-Dbundled.java.home=/opt/delivery/jdk 8" -o
+```
+
+默认 `clean` 会清空项目的 `target/` 目录，默认跳过测试；额外 Maven 参数可覆盖默认选项（例如 `-DskipTests=false`）。`-o` 要求构建所需依赖和插件已缓存。也可继续直接执行 Maven：
 
 ```text
 mvn clean package -DskipTests
@@ -32,6 +48,8 @@ mvn clean package -DskipTests
 
 - `target/light-db-migration.jar`：可执行服务。
 - `target/light-db-migration-<项目版本>.zip`：完整现场交付包，包含 Jar、`runtime/` Java 运行环境、README、Windows/Linux 启动脚本及完整 `docs` 文档目录。
+
+`build.bat`、`build.sh` 是源码仓库中的开发打包入口，不进入现场 ZIP；现场使用 `start.bat`、`start.sh` 启动服务。
 
 默认将构建所用 Java 的安装目录打入 `runtime/`；JDK 8 自动使用其 JDK 根目录，保留运行库及原有许可证文件。不需要再手工复制文件或二次压缩。也可指定待交付的 64 位 JDK/JRE 8 目录：
 
