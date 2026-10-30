@@ -22,8 +22,11 @@ import java.sql.SQLException;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.LinkedHashSet;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -32,6 +35,8 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * 使用轻量 JDBC 代理验证：同一步骤和后续步骤的结构问题会一次性汇总。
+ * Author: Codex
+ * date: 2026-10-30
  */
 public class StructureValidationAggregationCheck {
 
@@ -52,6 +57,22 @@ public class StructureValidationAggregationCheck {
     private static final int SECOND_NUMERIC_MINIMUM_INDEX = 4;
     private static final String JDBC_PREPARE_STATEMENT = "prepareStatement";
     private static final String MYSQL_COLUMN_CATALOG = "information_schema.COLUMNS";
+    /** 测试目录的明确数据库名。 */
+    private static final String FIXTURE_CATALOG = "test_db";
+    /** Oracle/达梦目录的明确大写模式名。 */
+    private static final String FIXTURE_SCHEMA = "TEST_DB";
+    /** 物理字段目录表名绑定下标。 */
+    private static final int TABLE_PARAMETER = 2;
+    /** 显式源列别名测试中的真实字段名。 */
+    private static final String DEFAULT_PHYSICAL_COLUMN = "VIP_LEVEL";
+    /** 显式源列别名测试中的查询字段名。 */
+    private static final String DEFAULT_QUERY_ALIAS = "VIP_ALIAS";
+    /** 可执行字段默认值声明关键字。 */
+    private static final String DEFAULT_KEYWORD = "DEFAULT";
+    /** MySQL JDBC 未声明浮点小数位的目录标记。 */
+    private static final int UNKNOWN_FLOAT_SCALE = 31;
+    /** MySQL 旧式 FLOAT(M,D) 的最大声明宽度。 */
+    private static final int MAX_FLOAT_WIDTH = 255;
 
     private final AtomicInteger sourceMetadataQueries = new AtomicInteger();
     private final AtomicInteger targetMetadataQueries = new AtomicInteger();
@@ -145,6 +166,102 @@ public class StructureValidationAggregationCheck {
         verifyCreateOrderIndependentSignature(engine);
         verifyPhysicalDefinitionSupplements(engine);
         verifyOriginalPreparedQueryMetadata(engine);
+        verifyOracleDefaultOriginsThroughQueryMetadata(engine);
+    }
+
+    /**
+     * Oracle 驱动不提供 getTableName 时，严格单表别名仍能还原默认值，复杂来源保持未知。
+     * Params: engine 当前生产迁移引擎。
+     * Returns: 无；通过实际 readQueryColumns 到 ADD 建议链路验证，不直接构造默认值元数据对象。
+     */
+    private void verifyOracleDefaultOriginsThroughQueryMetadata(MigrationEngine engine) throws Exception {
+        List<ColumnDef> physical = Arrays.asList(new ColumnDef(DEFAULT_PHYSICAL_COLUMN, Types.VARCHAR,
+            "VARCHAR2", 3, 0, DatabaseMetaData.columnNoNulls, "' '"));
+        List<ColumnDef> query = Arrays.asList(column(DEFAULT_QUERY_ALIAS, Types.VARCHAR, "VARCHAR2", 3, 0,
+            DatabaseMetaData.columnNoNulls));
+        String direct = "SELECT s.VIP_LEVEL AS VIP_ALIAS FROM " + SOURCE_ONE + " s";
+        Set<String> directStatements = queryDefaultSuggestions(engine, direct,
+            queryOriginConnection(physical, query, false));
+        assertContains(directStatements.toString(), "ADD (\"VIP_ALIAS\" VARCHAR2(3 CHAR) DEFAULT ' ' NOT NULL)",
+            "Oracle 不返回来源表时，严格单表显式别名没有继承真实源字段空格默认值");
+
+        String joined = "SELECT a.VIP_LEVEL AS VIP_ALIAS FROM " + SOURCE_ONE + " a JOIN " + SOURCE_TWO
+            + " b ON a.VIP_LEVEL=b.VIP_LEVEL";
+        Set<String> unknownStatements = queryDefaultSuggestions(engine, joined,
+            queryOriginConnection(physical, query, false));
+        assertContains(unknownStatements.toString(), "默认值", "复杂查询来源未知时没有说明默认值缺失");
+        for (String statement : unknownStatements) {
+            assertNoExecutableLine(statement, "ALTER TABLE", "复杂查询来源未知时仍生成丢失默认值的可执行建议");
+        }
+
+        String cast = "SELECT CAST(VIP_LEVEL AS VARCHAR2(3)) AS VIP_ALIAS FROM " + SOURCE_ONE;
+        Set<String> expressionStatements = queryDefaultSuggestions(engine, cast,
+            queryOriginConnection(physical, query, true));
+        assertContains(expressionStatements.toString(), "ADD (\"VIP_ALIAS\" VARCHAR2(3 CHAR) NOT NULL)",
+            "已确认 CAST 表达式应按查询定义生成建议");
+        if (expressionStatements.toString().contains(DEFAULT_KEYWORD)) {
+            throw new AssertionError("CAST 表达式错误继承了物理来源字段默认值");
+        }
+    }
+
+    /**
+     * 从原始预编译查询描述读取列后调用生产 ADD 生成入口。
+     * Params: engine 生产引擎；sql 原始 SQL；connection 带真实列目录的内存连接。
+     * Returns: 当前单字段的实际结构建议。
+     */
+    private Set<String> queryDefaultSuggestions(MigrationEngine engine, String sql, Connection connection) throws Exception {
+        CreateTaskRequest request = new CreateTaskRequest();
+        request.setSteps(Collections.emptyList());
+        MigrationTask task = new MigrationTask("ORACLE-QUERY-DEFAULT-ORIGIN-CHECK", request);
+        Method read = MigrationEngine.class.getDeclaredMethod("readQueryColumns", MigrationTask.class,
+            Connection.class, String.class, String.class);
+        read.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        List<Object> columns = (List<Object>)read.invoke(engine, task, connection, sql, MigrationConstants.DB_ORACLE);
+        assertEquals(1, columns.size(), "单字段查询描述返回字段数不正确");
+        Class<?> columnType = Class.forName(MigrationEngine.class.getName() + "$ColumnMeta");
+        Method add = MigrationEngine.class.getDeclaredMethod("addColumnStatement", Set.class, QualifiedName.class,
+            columnType, String.class, String.class);
+        add.setAccessible(true);
+        Set<String> statements = new LinkedHashSet<>();
+        add.invoke(engine, statements, SqlSupport.parseTargetTable(TARGET_ONE), columns.get(0),
+            MigrationConstants.DB_ORACLE, MigrationConstants.DB_ORACLE);
+        return statements;
+    }
+
+    /**
+     * 直列案例模拟 Oracle 来源表为空；表达式案例模拟驱动仍报告物理来源但 SQL 已明确为 CAST。
+     * Params: physical 物理列目录；query 查询投影；reportedOrigin 是否模拟驱动报告来源。
+     * Returns: 只描述查询和读取受限目录，执行原始查询数据行直接失败的连接。
+     */
+    private Connection queryOriginConnection(final List<ColumnDef> physical, final List<ColumnDef> query,
+        final boolean reportedOrigin) {
+        ResultSetMetaData base = resultSetMetaData(query);
+        ResultSetMetaData described = proxy(ResultSetMetaData.class, (proxy, method, arguments) -> {
+            if (reportedOrigin && "getTableName".equals(method.getName())) {
+                return SOURCE_ONE;
+            }
+            if (reportedOrigin && "getColumnName".equals(method.getName())) {
+                return DEFAULT_PHYSICAL_COLUMN;
+            }
+            return method.invoke(base, arguments);
+        });
+        return proxy(Connection.class, (proxy, method, arguments) -> {
+            switch (method.getName()) {
+                case "getSchema": return FIXTURE_SCHEMA;
+                case "getCatalog": return FIXTURE_CATALOG;
+                case "getMetaData": return databaseMetaData(physical);
+                case "prepareStatement":
+                    return proxy(PreparedStatement.class, (statement, called, parameters) -> {
+                        switch (called.getName()) {
+                            case "getMetaData": return described;
+                            case "executeQuery": throw new AssertionError("默认值补读不得执行原始查询数据行");
+                            default: return defaultValue(called.getReturnType());
+                        }
+                    });
+                default: return defaultValue(method.getReturnType());
+            }
+        });
     }
 
     private void verifyDefaultNamespaceAliases(MigrationEngine engine) throws Exception {
@@ -304,6 +421,9 @@ public class StructureValidationAggregationCheck {
                                 return defaultValue(called.getReturnType());
                         }
                     });
+                case "getSchema": return FIXTURE_SCHEMA;
+                case "getCatalog": return FIXTURE_CATALOG;
+                case "getMetaData": return databaseMetaData(physical);
                 default:
                     return defaultValue(method.getReturnType());
             }
@@ -544,7 +664,7 @@ public class StructureValidationAggregationCheck {
                     return proxy(PreparedStatement.class, (statement, called, parameters) -> {
                         switch (called.getName()) {
                             case "executeQuery":
-                                return sql.contains(MYSQL_COLUMN_CATALOG) ? emptyResultSet()
+                                return sql.contains(MYSQL_COLUMN_CATALOG) ? physicalCatalogRows(columns, SOURCE_ONE)
                                     : sql.contains("WHERE 1 = 0") ? metadataResultSet(columns) : countResultSet();
                             default:
                                 return defaultValue(called.getReturnType());
@@ -554,7 +674,7 @@ public class StructureValidationAggregationCheck {
                 case "getSchema":
                     return "test_db";
                 case "getMetaData":
-                    return databaseMetaData();
+                    return databaseMetaData(columns);
                 default:
                     return defaultValue(method.getReturnType());
             }
@@ -951,18 +1071,18 @@ public class StructureValidationAggregationCheck {
 
     private PreparedStatement cursorPreparedStatement(final String sql, final boolean source,
         final AtomicReference<String> statisticsSql) {
+        final List<ColumnDef> columns = Arrays.asList(column(APPLICATION_CURSOR, Types.VARCHAR, "VARCHAR", 64),
+            column("NAME", Types.VARCHAR, "VARCHAR", 100));
         InvocationHandler handler = new InvocationHandler() {
             @Override
             public Object invoke(Object proxy, Method method, Object[] arguments) {
                 String name = method.getName();
                 if ("executeQuery".equals(name)) {
                     if (sql.contains(MYSQL_COLUMN_CATALOG)) {
-                        return emptyResultSet();
+                        return physicalCatalogRows(columns, source ? CURSOR_SOURCE : CURSOR_TARGET);
                     }
                     if (sql.contains("WHERE 1 = 0")) {
-                        return metadataResultSet(Arrays.asList(
-                            column(APPLICATION_CURSOR, Types.VARCHAR, "VARCHAR", 64),
-                            column("NAME", Types.VARCHAR, "VARCHAR", 100)));
+                        return metadataResultSet(columns);
                     }
                     if (source) {
                         statisticsSql.set(sql);
@@ -1043,12 +1163,17 @@ public class StructureValidationAggregationCheck {
 
     private PreparedStatement preparedStatement(final String sql, final boolean source) {
         InvocationHandler handler = new InvocationHandler() {
+            private String boundTable;
+
             @Override
             public Object invoke(Object proxy, Method method, Object[] arguments) {
                 String name = method.getName();
+                if ("setString".equals(name) && ((Integer)arguments[0]) == TABLE_PARAMETER) {
+                    boundTable = String.valueOf(arguments[1]);
+                }
                 if ("executeQuery".equals(name)) {
                     if (sql.contains(MYSQL_COLUMN_CATALOG)) {
-                        return emptyResultSet();
+                        return physicalCatalogRows(columnsFor(boundTable, source), boundTable);
                     }
                     if (sql.contains("WHERE 1 = 0")) {
                         if (source) {
@@ -1166,18 +1291,122 @@ public class StructureValidationAggregationCheck {
     }
 
     private DatabaseMetaData databaseMetaData() {
+        return databaseMetaData(Collections.emptyList());
+    }
+
+    /**
+     * 为已确认物理来源提供精确目录；默认值 null 表示目录已明确返回无默认值。
+     * Params: columns 本连接独立的物理字段定义。
+     * Returns: 支持 getColumns 的 JDBC 元数据代理，主键及索引仍按测试原场景为空。
+     */
+    private DatabaseMetaData databaseMetaData(final List<ColumnDef> columns) {
         InvocationHandler handler = new InvocationHandler() {
             @Override
             public Object invoke(Object proxy, Method method, Object[] arguments) {
                 String methodName = method.getName();
-                if ("getColumns".equals(methodName) || "getPrimaryKeys".equals(methodName)
-                    || "getIndexInfo".equals(methodName)) {
+                if ("getSearchStringEscape".equals(methodName)) {
+                    return "\\";
+                }
+                if ("getUserName".equals(methodName)) {
+                    return FIXTURE_SCHEMA;
+                }
+                if ("getColumns".equals(methodName)) {
+                    String table = String.valueOf(arguments[2]).replace("\\_", "_").replace("\\%", "%");
+                    return physicalCatalogRows(columns, table);
+                }
+                if ("getPrimaryKeys".equals(methodName) || "getIndexInfo".equals(methodName)) {
                     return emptyResultSet();
                 }
                 return defaultValue(method.getReturnType());
             }
         };
         return proxy(DatabaseMetaData.class, handler);
+    }
+
+    /**
+     * 单张物理表目录同时支持 MySQL information_schema 和 JDBC getColumns；重复投影不能重复物理列。
+     * Params: projected 当前 fixture 已明确的物理列；table 精确被查表名。
+     * Returns: 包含默认值已读取标记所需实际 SQL NULL 的目录结果。
+     */
+    private ResultSet physicalCatalogRows(List<ColumnDef> projected, final String table) {
+        Map<String, ColumnDef> unique = new LinkedHashMap<>();
+        for (ColumnDef column : projected) {
+            unique.put(column.name.toUpperCase(Locale.ROOT), column);
+        }
+        final List<ColumnDef> columns = new ArrayList<>(unique.values());
+        return proxy(ResultSet.class, new InvocationHandler() {
+            private int index = -1;
+            private boolean wasNull;
+
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] arguments) {
+                String name = method.getName();
+                if ("next".equals(name)) {
+                    return ++index < columns.size();
+                }
+                if ("wasNull".equals(name)) {
+                    return wasNull;
+                }
+                if ("getString".equals(name) || "getLong".equals(name)) {
+                    ColumnDef column = columns.get(index);
+                    String key = String.valueOf(arguments[0]);
+                    Object value;
+                    switch (key) {
+                        case "TABLE_CAT": value = FIXTURE_CATALOG; break;
+                        case "TABLE_SCHEM": value = FIXTURE_SCHEMA; break;
+                        case "TABLE_NAME": value = table; break;
+                        case "COLUMN_NAME": value = column.name; break;
+                        case "TYPE_NAME": value = column.typeName; break;
+                        case "COLUMN_TYPE": value = fixtureNativeType(column); break;
+                        case "DATA_TYPE": value = "getString".equals(name) ? column.typeName : column.jdbcType; break;
+                        case "NULLABLE": value = column.nullable; break;
+                        case "IS_NULLABLE": value = column.nullable == DatabaseMetaData.columnNoNulls ? "NO"
+                            : column.nullable == DatabaseMetaData.columnNullable ? "YES" : null; break;
+                        case "COLUMN_SIZE":
+                        case "CHARACTER_MAXIMUM_LENGTH": value = column.precision; break;
+                        case "NUMERIC_PRECISION": value = column.jdbcType == Types.CHAR || column.jdbcType == Types.VARCHAR
+                            ? null : column.precision; break;
+                        case "NUMERIC_SCALE":
+                        case "DECIMAL_DIGITS": value = column.scale; break;
+                        case "COLUMN_DEF":
+                        case "COLUMN_DEFAULT": value = column.defaultValue; break;
+                        case "EXTRA": value = ""; break;
+                        default: value = null; break;
+                    }
+                    wasNull = value == null;
+                    if ("getString".equals(name)) {
+                        return value == null ? null : String.valueOf(value);
+                    }
+                    return value == null ? 0L : ((Number)value).longValue();
+                }
+                return defaultValue(method.getReturnType());
+            }
+        });
+    }
+
+    /**
+     * fixture 中完整字段定义；未指定小数位的 FLOAT 不虚构 (M,D)。
+     * Params: column 真实测试字段。
+     * Returns: MySQL 物理 COLUMN_TYPE 对应的原生声明。
+     */
+    private String fixtureNativeType(ColumnDef column) {
+        switch (column.jdbcType) {
+            case Types.CHAR:
+            case Types.VARCHAR:
+                return column.typeName + "(" + column.precision + ")";
+            case Types.NUMERIC:
+            case Types.DECIMAL:
+                return column.precision > 0 ? column.typeName + "(" + column.precision + "," + column.scale + ")"
+                    : column.typeName;
+            case Types.FLOAT:
+            case Types.REAL:
+            case Types.DOUBLE:
+                return column.scale >= 0 && column.scale < UNKNOWN_FLOAT_SCALE && column.scale <= column.precision
+                    && column.precision <= MAX_FLOAT_WIDTH
+                    ? column.typeName + "(" + column.precision + "," + column.scale + ")" : column.typeName;
+            default:
+                return column.typeName;
+        }
     }
 
     private ResultSet emptyResultSet() {
@@ -1262,18 +1491,30 @@ public class StructureValidationAggregationCheck {
         private final int precision;
         private final int scale;
         private final int nullable;
+        /** 已从物理目录确认的默认值，null 表示无默认值。 */
+        private final String defaultValue;
 
         private ColumnDef(String name, int jdbcType, String typeName, int precision) {
             this(name, jdbcType, typeName, precision, 0, DatabaseMetaData.columnNullable);
         }
 
         private ColumnDef(String name, int jdbcType, String typeName, int precision, int scale, int nullable) {
+            this(name, jdbcType, typeName, precision, scale, nullable, null);
+        }
+
+        /**
+         * Params: name 字段名；jdbcType/typeName 类型；precision/scale 定义维度；nullable 可空性；defaultValue 目录默认值。
+         * Returns: 明确物理默认值的 fixture 定义。
+         */
+        private ColumnDef(String name, int jdbcType, String typeName, int precision, int scale, int nullable,
+            String defaultValue) {
             this.name = name;
             this.jdbcType = jdbcType;
             this.typeName = typeName;
             this.precision = precision;
             this.scale = scale;
             this.nullable = nullable;
+            this.defaultValue = defaultValue;
         }
     }
 }

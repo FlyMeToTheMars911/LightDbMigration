@@ -485,11 +485,13 @@ public class MigrationEngine {
         StringBuilder script = new StringBuilder();
         script.append("-- Light DB Migration 表结构同步建议脚本").append(SCRIPT_LINE_BREAK)
             .append("-- 目标数据库类型：").append(targetType).append(SCRIPT_LINE_BREAK)
-            .append("-- 重要：本脚本仅根据源查询结果元数据生成，工具不会未经确认执行；点击执行脚本并再次确认后执行。")
+            .append("-- 重要：本脚本根据源查询结果及已确认物理来源元数据生成，工具不会未经确认执行；点击执行脚本并再次确认后执行。")
             .append(SCRIPT_LINE_BREAK)
             .append("-- 字段集合、映射后的类型/长度/精度及可空性以源查询为准；多余字段会删除。")
             .append(SCRIPT_LINE_BREAK)
             .append("-- 主键、索引、默认值、自增、字符集和注释不在本次字段比对范围；DDL 可能受现有数据或约束影响。")
+            .append(SCRIPT_LINE_BREAK)
+            .append("-- 生成字段 DDL 时携带已确认且可转换的源默认值；查询表达式不继承物理默认值，仅默认值不同不触发差异。")
             .append(SCRIPT_LINE_BREAK)
             .append(SCRIPT_LINE_BREAK)
             .append("-- 本次校验问题").append(SCRIPT_LINE_BREAK);
@@ -535,16 +537,19 @@ public class MigrationEngine {
             }
             String typeDefinition = targetTypeDefinition(sourceColumn, sourceType, targetType);
             String nullable = sourceNullableClause(sourceColumn);
-            if (typeDefinition == null || nullable == null) {
+            String defaultClause = sourceColumn.defaultValue.clause(sourceType, targetType);
+            if (typeDefinition == null || nullable == null || defaultClause == null) {
                 statements.add("-- 未生成 " + quotedQualifiedName(targetName, targetType)
                     + " 的 CREATE TABLE：字段 " + sanitizeScriptComment(sourceColumn.name)
-                    + " 的源类型或可空性无法可靠映射：" + sanitizeScriptComment(sourceColumn.typeName)
-                    + " " + nullableDescription(sourceColumn) + "。");
+                    + " 的源类型、可空性或默认值无法可靠映射：" + sanitizeScriptComment(sourceColumn.typeName)
+                    + " " + nullableDescription(sourceColumn) + "，默认值="
+                    + sanitizeScriptComment(sourceColumn.defaultValue.describe()) + "；请核对源定义并人工转换默认值。");
                 return;
             }
             definitions.add("    " + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition
-                + nullable);
-            signatures.add(normalizedName + "\u0000" + typeDefinition + nullable);
+                + defaultClause + nullable);
+            signatures.add(normalizedName + "\u0000" + typeDefinition + nullable + "\u0000"
+                + sourceColumn.defaultValue.signature());
         }
         Collections.sort(signatures);
         addStructureStatement(statements, targetName, null, targetType,
@@ -566,23 +571,25 @@ public class MigrationEngine {
         }
         String typeDefinition = targetTypeDefinition(sourceColumn, sourceType, targetType);
         String nullable = sourceNullableClause(sourceColumn);
-        if (typeDefinition == null || nullable == null) {
+        String defaultClause = sourceColumn.defaultValue.clause(sourceType, targetType);
+        if (typeDefinition == null || nullable == null || defaultClause == null) {
             statements.add("-- 目标表 " + quotedQualifiedName(targetName, targetType) + " 缺少字段 "
                 + sanitizeScriptComment(quotedColumnName(sourceColumn.name, targetType)) + "，但源类型 "
                 + sanitizeScriptComment(sourceColumn.typeName) + " 或可空性（" + nullableDescription(sourceColumn)
-                + "）无法可靠映射，未生成该字段 DDL。");
+                + "）或默认值（" + sanitizeScriptComment(sourceColumn.defaultValue.describe())
+                + "）无法可靠映射，未生成该字段 DDL；请核对源定义并人工转换默认值。");
             return;
         }
         if (MigrationConstants.DB_MYSQL.equals(targetType)) {
             addStructureStatement(statements, targetName, sourceColumn.name, targetType,
                 "ALTER TABLE " + quotedQualifiedName(targetName, targetType) + " ADD COLUMN "
-                + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition + nullable + ";",
-                "ADD\u0000" + typeDefinition + nullable);
+                + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition + defaultClause + nullable + ";",
+                "ADD\u0000" + typeDefinition + nullable + "\u0000" + sourceColumn.defaultValue.signature());
         } else {
             addStructureStatement(statements, targetName, sourceColumn.name, targetType,
                 "ALTER TABLE " + quotedQualifiedName(targetName, targetType) + " ADD ("
-                + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition + nullable + ");",
-                "ADD\u0000" + typeDefinition + nullable);
+                + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition + defaultClause + nullable + ");",
+                "ADD\u0000" + typeDefinition + nullable + "\u0000" + sourceColumn.defaultValue.signature());
         }
     }
 
@@ -598,26 +605,30 @@ public class MigrationEngine {
         }
         String typeDefinition = targetTypeDefinition(sourceColumn, sourceType, targetType);
         String nullableClause = sourceNullableClause(sourceColumn);
-        if (typeDefinition == null || nullableClause == null) {
+        String defaultClause = sourceColumn.defaultValue.clause(sourceType, targetType);
+        if (typeDefinition == null || nullableClause == null || defaultClause == null) {
             statements.add("-- 目标表 " + quotedQualifiedName(targetName, targetType) + " 的字段 "
                 + quotedColumnName(sourceColumn.name, targetType) + " 需要调整，但源类型 "
                 + sanitizeScriptComment(sourceColumn.typeName) + " 或可空性（" + nullableDescription(sourceColumn)
-                + "）无法可靠映射，未生成该字段 DDL。");
+                + "）或默认值（" + sanitizeScriptComment(sourceColumn.defaultValue.describe())
+                + "）无法可靠映射，未生成该字段 DDL；请核对源定义并人工转换默认值。");
             return;
         }
         if (MigrationConstants.DB_MYSQL.equals(targetType)) {
             addStructureStatement(statements, targetName, sourceColumn.name, targetType,
                 "ALTER TABLE " + quotedQualifiedName(targetName, targetType)
                 + " MODIFY COLUMN " + quotedColumnName(sourceColumn.name, targetType) + " "
-                + typeDefinition + nullableClause + ";", "MODIFY\u0000" + typeDefinition + nullableClause);
+                + typeDefinition + defaultClause + nullableClause + ";", "MODIFY\u0000" + typeDefinition
+                + nullableClause + "\u0000" + sourceColumn.defaultValue.signature());
         } else {
             if (targetColumn != null && sourceColumn.nullable == targetColumn.nullable) {
                 nullableClause = "";
             }
             addStructureStatement(statements, targetName, sourceColumn.name, targetType,
                 "ALTER TABLE " + quotedQualifiedName(targetName, targetType) + " MODIFY ("
-                + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition + nullableClause + ");",
-                "MODIFY\u0000" + typeDefinition + sourceNullableClause(sourceColumn));
+                + quotedColumnName(sourceColumn.name, targetType) + " " + typeDefinition + defaultClause + nullableClause + ");",
+                "MODIFY\u0000" + typeDefinition + sourceNullableClause(sourceColumn) + "\u0000"
+                    + sourceColumn.defaultValue.signature());
         }
     }
 
@@ -683,7 +694,7 @@ public class MigrationEngine {
             String objectName = canonicalStructureTable(suggestions, table, targetType) + "."
                 + quotedColumnName(normalizeName(column.name), targetType);
             String definition = present ? targetTypeDefinition(column, sourceType, targetType)
-                + " " + nullableDescription(column) : "DROP COLUMN";
+                + " " + nullableDescription(column) + "\u0000" + column.defaultValue.signature() : "DROP COLUMN";
             suggestions.expectColumn(objectName, definition);
         }
     }
@@ -1029,13 +1040,14 @@ public class MigrationEngine {
     private List<ColumnMeta> readQueryColumns(MigrationTask task, Connection connection, String sourceSql,
         String databaseType) throws Exception {
         task.checkpoint();
+        QueryColumnOriginSupport origins = QueryColumnOriginSupport.parse(sourceSql);
         task.backendSql("JDBC元数据[原始迁移查询描述]：PreparedStatement.getMetaData；SQL=" + sourceSql);
         try (PreparedStatement statement = connection.prepareStatement(sourceSql)) {
             task.setCurrentStatement(statement);
             try {
                 ResultSetMetaData metadata = statement.getMetaData();
                 if (metadata != null) {
-                    List<ColumnMeta> described = readColumns(task, connection, metadata, databaseType, null);
+                    List<ColumnMeta> described = readColumns(task, connection, metadata, databaseType, null, origins);
                     task.checkpoint();
                     if (!described.isEmpty()) {
                         return described;
@@ -1055,7 +1067,7 @@ public class MigrationEngine {
         try (PreparedStatement statement = connection.prepareStatement(metadataSql)) {
             task.setCurrentStatement(statement);
             try (ResultSet resultSet = statement.executeQuery()) {
-                return readColumns(task, connection, resultSet.getMetaData(), databaseType, null);
+                return readColumns(task, connection, resultSet.getMetaData(), databaseType, null, origins);
             } finally {
                 task.clearCurrentStatement(statement);
             }
@@ -1077,6 +1089,16 @@ public class MigrationEngine {
 
     private List<ColumnMeta> readColumns(MigrationTask task, Connection connection, ResultSetMetaData metaData,
         String databaseType, QualifiedName targetName) throws Exception {
+        return readColumns(task, connection, metaData, databaseType, targetName, QueryColumnOriginSupport.parse(null));
+    }
+
+    /**
+     * Params: task 当前任务；connection 当前连接；metaData 查询描述；databaseType 方言；
+     * targetName 明确的物理表或 null；origins 严格单表查询的来源映射。
+     * Returns: 保留已确认物理默认值的列；无法确认的默认值保持未知，不伪装成无默认值。
+     */
+    private List<ColumnMeta> readColumns(MigrationTask task, Connection connection, ResultSetMetaData metaData,
+        String databaseType, QualifiedName targetName, QueryColumnOriginSupport origins) throws Exception {
         List<ColumnMeta> columns = new ArrayList<>();
         Map<String, Map<String, PhysicalColumnMetadataSupport.Definition>> physicalTables = new HashMap<>();
         for (int i = 1; i <= metaData.getColumnCount(); i++) {
@@ -1085,52 +1107,10 @@ public class MigrationEngine {
                 label = metaData.getColumnName(i);
             }
             ColumnMeta column = new ColumnMeta(label, metaData.getColumnType(i), metaData.getColumnTypeName(i),
-                metaData.getPrecision(i), metaData.getScale(i), metaData.isNullable(i), metaData.isAutoIncrement(i));
-            if (MigrationConstants.DB_MYSQL.equals(databaseType)
-                || sourceNullableClause(column) == null || unknownNumericPrecision(column, databaseType)
-                || oracleIntervalAlias(column.typeName, databaseType)) {
-                QualifiedName physicalTable = targetName;
-                String physicalColumn = null;
-                try {
-                    physicalColumn = metaData.getColumnName(i);
-                    if (physicalTable == null) {
-                        String table = metaData.getTableName(i);
-                        if (!isBlank(table) && !isBlank(physicalColumn)) {
-                            String namespace = MigrationConstants.DB_MYSQL.equals(databaseType)
-                                ? metaData.getCatalogName(i) : metaData.getSchemaName(i);
-                            physicalTable = SqlSupport.parseTableName(isBlank(namespace) ? table : namespace + "." + table,
-                                "源字段物理来源表");
-                        }
-                    } else if (isBlank(physicalColumn)) {
-                        physicalColumn = label;
-                    }
-                } catch (Exception exception) {
-                    throwIfControlRequested(task);
-                    if (isConnectionFailure(exception)) {
-                        throw exception;
-                    }
-                    task.warn("字段 " + label + " 的物理来源不可读取，保留查询元数据：" + SqlSupport.safeMessage(exception));
-                }
-                if (physicalTable != null && !isBlank(physicalColumn)) {
-                    String tableKey = physicalTable.toSql();
-                    Map<String, PhysicalColumnMetadataSupport.Definition> definitions = physicalTables.get(tableKey);
-                    if (definitions == null) {
-                        try {
-                            definitions = PhysicalColumnMetadataSupport.read(task, connection, databaseType, physicalTable);
-                        } catch (Exception exception) {
-                            throwIfControlRequested(task);
-                            if (isConnectionFailure(exception)) {
-                                throw exception;
-                            }
-                            task.warn("物理表 " + tableKey + " 的字段补充元数据不可读取，继续使用已知查询信息："
-                                + SqlSupport.safeMessage(exception));
-                            definitions = Collections.emptyMap();
-                        }
-                        physicalTables.put(tableKey, definitions);
-                    }
-                    column = supplementColumn(column, definitions.get(normalizeName(physicalColumn)), databaseType);
-                }
-            }
+                metaData.getPrecision(i), metaData.getScale(i), metaData.isNullable(i), metaData.isAutoIncrement(i),
+                null, ColumnDefaultValue.unknown());
+            column = supplementPhysicalColumn(task, connection, metaData, i, column, databaseType,
+                targetName, origins, physicalTables);
             if (oracleIntervalAlias(column.typeName, databaseType) && column.nativeType == null) {
                 task.warn("字段 " + label + " 仅有 Oracle INTERVAL 驱动别名，未取得物理目录的完整声明；"
                     + "不能根据访问器 precision/scale 推测前导精度，未生成该字段 DDL");
@@ -1138,6 +1118,72 @@ public class MigrationEngine {
             columns.add(column);
         }
         return columns;
+    }
+
+    /**
+     * 按驱动来源或严格单表来源补读，明确计算表达式不继承物理列默认值。
+     * Params: task/connection 当前任务与连接；metadata/index 当前查询列；column 已知定义；databaseType 方言；
+     * targetName 目标物理表或 null；origins 原 SQL 来源；physicalTables 当前查询按表缓存。
+     * Returns: 补充后的列；普通目录失败保留未知默认值，连接或控制异常立即退出。
+     */
+    private ColumnMeta supplementPhysicalColumn(MigrationTask task, Connection connection, ResultSetMetaData metadata,
+        int index, ColumnMeta column, String databaseType, QualifiedName targetName, QueryColumnOriginSupport origins,
+        Map<String, Map<String, PhysicalColumnMetadataSupport.Definition>> physicalTables) throws Exception {
+        QualifiedName physicalTable = targetName;
+        String physicalColumn = null;
+        QueryColumnOriginSupport.Origin origin = origins.column(index, column.name);
+        if (targetName == null && origin.expression) {
+            return new ColumnMeta(column.name, column.jdbcType, column.typeName, column.precision, column.scale,
+                column.nullable, column.autoIncrement, column.nativeType, ColumnDefaultValue.none());
+        }
+        try {
+            physicalColumn = metadata.getColumnName(index);
+            if (physicalTable == null) {
+                String table = metadata.getTableName(index);
+                if (!isBlank(table) && !isBlank(physicalColumn)) {
+                    String namespace = MigrationConstants.DB_MYSQL.equals(databaseType)
+                        ? metadata.getCatalogName(index) : metadata.getSchemaName(index);
+                    physicalTable = SqlSupport.parseTableName(isBlank(namespace) ? table : namespace + "." + table,
+                        "源字段物理来源表");
+                }
+            } else if (isBlank(physicalColumn)) {
+                physicalColumn = column.name;
+            }
+        } catch (Exception exception) {
+            throwIfControlRequested(task);
+            if (isConnectionFailure(exception)) {
+                throw exception;
+            }
+            task.warn("字段 " + column.name + " 的物理来源不可读取：" + SqlSupport.safeMessage(exception));
+        }
+        if (physicalTable == null && origin.table != null) {
+            physicalTable = origin.table;
+            physicalColumn = origin.columnName;
+            task.backendSql("字段物理来源[严格单表查询]：字段=" + column.name + "；源表="
+                + physicalTable.toSql() + "；源字段=" + physicalColumn);
+        }
+        if (physicalTable == null || isBlank(physicalColumn)) {
+            task.backendSql("字段默认值[来源未知]：字段=" + column.name
+                + "；不能确定源默认值，结构建议需核对源定义后人工处理");
+            return column;
+        }
+        String tableKey = physicalTable.toSql();
+        Map<String, PhysicalColumnMetadataSupport.Definition> definitions = physicalTables.get(tableKey);
+        if (definitions == null) {
+            try {
+                definitions = PhysicalColumnMetadataSupport.read(task, connection, databaseType, physicalTable);
+            } catch (Exception exception) {
+                throwIfControlRequested(task);
+                if (isConnectionFailure(exception)) {
+                    throw exception;
+                }
+                task.warn("物理表 " + tableKey + " 的字段补充元数据不可读取，默认值保持未知："
+                    + SqlSupport.safeMessage(exception));
+                definitions = Collections.emptyMap();
+            }
+            physicalTables.put(tableKey, definitions);
+        }
+        return supplementColumn(column, definitions.get(normalizeName(physicalColumn)), databaseType);
     }
 
     /**
@@ -1152,7 +1198,7 @@ public class MigrationEngine {
 
     /**
      * Params: query 查询描述；physical 来源明确的物理列；databaseType 当前方言。
-     * Returns: 只补缺失属性及 MySQL 完整枚举、浮点和 ZEROFILL 声明，不覆盖已知表达式定义。
+     * Returns: 补充已确认的物理默认值、缺失属性及 MySQL 完整原生声明，不覆盖已知表达式定义。
      */
     private ColumnMeta supplementColumn(ColumnMeta query, PhysicalColumnMetadataSupport.Definition physical,
         String databaseType) {
@@ -1209,7 +1255,8 @@ public class MigrationEngine {
                 nativeType = interval;
             }
         }
-        return new ColumnMeta(query.name, jdbcType, typeName, precision, scale, nullable, query.autoIncrement, nativeType);
+        return new ColumnMeta(query.name, jdbcType, typeName, precision, scale, nullable, query.autoIncrement,
+            nativeType, physical.defaultValue);
     }
 
     /** Params: typeName 驱动类型名；databaseType 当前方言。 Returns: 是否需从实际目录取得完整 Oracle 间隔声明。 */
@@ -2145,6 +2192,8 @@ public class MigrationEngine {
         private final int nullable;
         private final boolean autoIncrement;
         private final String nativeType;
+        /** 物理来源默认值；表达式查询不推测物理默认值。 */
+        private final ColumnDefaultValue defaultValue;
 
         private ColumnMeta(String name, int jdbcType, String typeName, int precision, int scale, int nullable,
             boolean autoIncrement) {
@@ -2153,6 +2202,17 @@ public class MigrationEngine {
 
         private ColumnMeta(String name, int jdbcType, String typeName, int precision, int scale, int nullable,
             boolean autoIncrement, String nativeType) {
+            this(name, jdbcType, typeName, precision, scale, nullable, autoIncrement, nativeType,
+                ColumnDefaultValue.none());
+        }
+
+        /**
+         * Params: name 字段名；jdbcType/typeName 类型；precision/scale 精度；nullable 可空性；
+         * autoIncrement 自增标志；nativeType 原生类型；defaultValue 已确认的源默认值。
+         * Returns: 供结构建议使用的列定义。
+         */
+        private ColumnMeta(String name, int jdbcType, String typeName, int precision, int scale, int nullable,
+            boolean autoIncrement, String nativeType, ColumnDefaultValue defaultValue) {
             this.name = name;
             this.jdbcType = jdbcType;
             this.typeName = typeName;
@@ -2161,6 +2221,7 @@ public class MigrationEngine {
             this.nullable = nullable;
             this.autoIncrement = autoIncrement;
             this.nativeType = nativeType;
+            this.defaultValue = defaultValue;
         }
     }
 

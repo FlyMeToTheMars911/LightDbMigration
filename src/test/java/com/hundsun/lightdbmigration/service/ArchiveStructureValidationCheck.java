@@ -1508,7 +1508,8 @@ public class ArchiveStructureValidationCheck {
          */
         private ResultSet catalogRows(String table, boolean intervalDictionary) {
             List<Column> candidates = catalogDefinitions.containsKey(table)
-                ? catalogDefinitions.get(table) : Collections.emptyList();
+                ? catalogDefinitions.get(table) : tables.containsKey(table) && tables.get(table) != null
+                ? tables.get(table) : Collections.emptyList();
             final List<Column> columns = new ArrayList<>();
             for (Column column : candidates) {
                 if (!intervalDictionary || column.nativeType != null

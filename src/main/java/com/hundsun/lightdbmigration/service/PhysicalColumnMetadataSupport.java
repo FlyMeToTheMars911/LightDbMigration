@@ -12,6 +12,8 @@ import java.sql.SQLFeatureNotSupportedException;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * 按明确的单张物理表补读字段定义，不将缺失的元数据推测为实际字段属性。
@@ -22,7 +24,7 @@ final class PhysicalColumnMetadataSupport {
 
     /** MySQL 字段目录查询只绑定指定数据库及表名，不扫描其他表。 */
     private static final String MYSQL_COLUMNS_SQL = "SELECT COLUMN_NAME, COLUMN_TYPE, DATA_TYPE, IS_NULLABLE, "
-        + "CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, DATETIME_PRECISION "
+        + "CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, DATETIME_PRECISION, COLUMN_DEFAULT, EXTRA "
         + "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION";
     /** Oracle 间隔类型按精确单表取完整声明，不把 JDBC 字节长度误当作前导精度。 */
     private static final String ORACLE_INTERVAL_COLUMNS_SQL = "SELECT COLUMN_NAME, DATA_TYPE, DATA_PRECISION, DATA_SCALE "
@@ -47,6 +49,21 @@ final class PhysicalColumnMetadataSupport {
     private static final long MAX_METADATA_INTEGER = Integer.MAX_VALUE;
     /** JDBC 字段目录最小可表示的小数位。 */
     private static final long MIN_METADATA_INTEGER = Integer.MIN_VALUE;
+    /** MariaDB 10.2.7 起默认值目录使用带 SQL 引号的字面量；可带 MySQL 握手兼容前缀。 */
+    private static final Pattern MARIADB_VERSION = Pattern.compile(
+        "(?i)(?:5\\.5\\.5-)?([0-9]+)\\.([0-9]+)\\.([0-9]+).*MariaDB.*");
+    /** 用于区分原生 MySQL 与 MariaDB 的产品版本标记。 */
+    private static final String MARIADB_MARKER = "MARIADB";
+    /** 带引用目录格式首次发布的版本。 */
+    private static final int QUOTED_DEFAULT_MAJOR = 10;
+    private static final int QUOTED_DEFAULT_MINOR = 2;
+    private static final int QUOTED_DEFAULT_PATCH = 7;
+    /** MariaDB 已支持表达式但目录尚未区分字面量的首个补丁版本。 */
+    private static final int AMBIGUOUS_DEFAULT_FIRST_PATCH = 1;
+    /** 版本正则中的各数字分组。 */
+    private static final int VERSION_MAJOR_GROUP = 1;
+    private static final int VERSION_MINOR_GROUP = 2;
+    private static final int VERSION_PATCH_GROUP = 3;
 
     /** Params: 无。 Returns: 不允许创建工具类实例。 */
     private PhysicalColumnMetadataSupport() {
@@ -124,7 +141,8 @@ final class PhysicalColumnMetadataSupport {
                     if (original != null) {
                         definitions.put(name.trim().toUpperCase(Locale.ROOT),
                             new Definition(original.name, nativeType, original.typeName,
-                                original.jdbcType, original.precision, original.scale, original.nullable));
+                                original.jdbcType, original.precision, original.scale, original.nullable,
+                                original.defaultValue));
                     }
                 }
                 checkControl(task);
@@ -149,6 +167,7 @@ final class PhysicalColumnMetadataSupport {
             throw new SQLException("无法确定 MySQL 物理表所属数据库，未执行全库字段扫描");
         }
         String tableName = table.getTable();
+        boolean quotedDefaults = quotedMysqlDefaults(task, connection);
         task.backendSql("SQL执行[物理字段定义补读]：" + MYSQL_COLUMNS_SQL + "；参数=[" + schema + ", "
             + tableName + "]");
         Map<String, Definition> definitions = new LinkedHashMap<>();
@@ -175,7 +194,8 @@ final class PhysicalColumnMetadataSupport {
                         scale = integer(rows, "DATETIME_PRECISION");
                     }
                     add(definitions, new Definition(name, nativeType, typeName, null, precision, scale,
-                        nullableCode));
+                        nullableCode, ColumnDefaultValue.mysql(rows.getString("COLUMN_DEFAULT"), typeName,
+                            rows.getString("EXTRA"), quotedDefaults)));
                 }
                 checkControl(task);
             } finally {
@@ -186,6 +206,37 @@ final class PhysicalColumnMetadataSupport {
             throw exception;
         }
         return definitions;
+    }
+
+    /**
+     * Params: task 当前任务；connection 已登录的 MySQL 兼容连接。
+     * Returns: 是否使用 MariaDB 的已引用目录格式；不能通过文本外观猜测默认值编码。
+     */
+    private static boolean quotedMysqlDefaults(MigrationTask task, Connection connection) throws SQLException {
+        DatabaseMetaData metadata = connection.getMetaData();
+        String version = metadata == null ? null : metadata.getDatabaseProductVersion();
+        if (version == null || !version.toUpperCase(Locale.ROOT).contains(MARIADB_MARKER)) {
+            return false;
+        }
+        Matcher matcher = MARIADB_VERSION.matcher(version);
+        if (!matcher.matches()) {
+            throw new SQLException("无法确认 MySQL 兼容数据库的默认值目录格式，请核对服务端版本并人工生成默认值");
+        }
+        try {
+            int major = Integer.parseInt(matcher.group(VERSION_MAJOR_GROUP));
+            int minor = Integer.parseInt(matcher.group(VERSION_MINOR_GROUP));
+            int patch = Integer.parseInt(matcher.group(VERSION_PATCH_GROUP));
+            if (major == QUOTED_DEFAULT_MAJOR && minor == QUOTED_DEFAULT_MINOR
+                && patch >= AMBIGUOUS_DEFAULT_FIRST_PATCH && patch < QUOTED_DEFAULT_PATCH) {
+                throw new SQLException("MariaDB 10.2.1～10.2.6 的目录无法可靠区分字符串与默认表达式，请人工核对源默认值");
+            }
+            boolean quoted = major > QUOTED_DEFAULT_MAJOR || major == QUOTED_DEFAULT_MAJOR
+                && (minor > QUOTED_DEFAULT_MINOR || minor == QUOTED_DEFAULT_MINOR && patch >= QUOTED_DEFAULT_PATCH);
+            task.backendSql("MySQL 兼容默认值目录格式：version=" + version + "；字符串已引用=" + quoted);
+            return quoted;
+        } catch (NumberFormatException exception) {
+            throw new SQLException("MySQL 兼容数据库版本无法解析，不能推测默认值目录格式", exception);
+        }
     }
 
     /**
@@ -239,7 +290,8 @@ final class PhysicalColumnMetadataSupport {
                     || nullable == DatabaseMetaData.columnNullable) ? nullable : DatabaseMetaData.columnNullableUnknown;
                 add(definitions, new Definition(nullableText(rows.getString("COLUMN_NAME")), null,
                     nullableText(rows.getString("TYPE_NAME")), integer(rows, "DATA_TYPE"),
-                    integer(rows, "COLUMN_SIZE"), integer(rows, "DECIMAL_DIGITS"), nullableCode));
+                    integer(rows, "COLUMN_SIZE"), integer(rows, "DECIMAL_DIGITS"), nullableCode,
+                    ColumnDefaultValue.jdbc(rows.getString("COLUMN_DEF"))));
             }
             checkControl(task);
         } catch (Exception exception) {
@@ -315,6 +367,8 @@ final class PhysicalColumnMetadataSupport {
         final Integer scale;
         /** JDBC 可空标志，未可靠提供时为 columnNullableUnknown。 */
         final int nullable;
+        /** 已读取的源默认值；未知状态不能当作源没有默认值。 */
+        final ColumnDefaultValue defaultValue;
 
         /**
          * Params: name 字段名；nativeType 原生定义；typeName/jdbcType 类型；precision/scale 精度；nullable 可空性。
@@ -322,6 +376,16 @@ final class PhysicalColumnMetadataSupport {
          */
         Definition(String name, String nativeType, String typeName, Integer jdbcType, Integer precision,
             Integer scale, int nullable) {
+            this(name, nativeType, typeName, jdbcType, precision, scale, nullable, ColumnDefaultValue.none());
+        }
+
+        /**
+         * Params: name 字段名；nativeType 原生定义；typeName/jdbcType 类型；precision/scale 精度；
+         * nullable 可空性；defaultValue 可靠取得的默认值状态。
+         * Returns: 保留默认值且不推测缺失属性的字段定义。
+         */
+        Definition(String name, String nativeType, String typeName, Integer jdbcType, Integer precision,
+            Integer scale, int nullable, ColumnDefaultValue defaultValue) {
             this.name = name;
             this.nativeType = nativeType;
             this.typeName = typeName;
@@ -329,6 +393,7 @@ final class PhysicalColumnMetadataSupport {
             this.precision = precision;
             this.scale = scale;
             this.nullable = nullable;
+            this.defaultValue = defaultValue == null ? ColumnDefaultValue.unknown() : defaultValue;
         }
     }
 }

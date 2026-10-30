@@ -355,7 +355,7 @@ final class ArchiveStructureValidator {
     }
 
     /**
-     * 读取物理列并按需补齐完整原生类型和可空属性，保留查询驱动的已知类型标记。
+     * 读取物理列并补齐默认值、完整原生类型和可空属性，保留查询驱动的已知类型标记。
      * Params: task 当前任务；connection 当前连接；name 物理表；databaseType 方言。
      * Returns: 供物理结构比对和 DDL 生成使用的列。
      */
@@ -363,21 +363,14 @@ final class ArchiveStructureValidator {
         String databaseType) throws Exception {
         List<Column> columns = readColumns(task, connection,
             "SELECT * FROM " + quoteTable(name, databaseType) + " WHERE 1 = 0");
-        boolean supplement = MigrationConstants.DB_MYSQL.equals(databaseType);
-        for (Column column : columns) {
-            supplement |= needsPhysicalDefinition(databaseType, column.typeName, column.precision,
-                column.scale, column.nullable);
-        }
-        if (!supplement) {
-            return columns;
-        }
         Map<String, PhysicalColumnMetadataSupport.Definition> definitions =
             readPhysicalDefinitions(task, connection, databaseType, name);
         List<Column> result = new ArrayList<>();
         for (Column column : columns) {
             PhysicalColumnMetadataSupport.Definition definition = definitions.get(normalize(column.name));
             if (definition == null) {
-                result.add(column);
+                result.add(new Column(column.name, column.jdbcType, column.typeName, column.precision,
+                    column.scale, column.nullable, column.nativeType, ColumnDefaultValue.unknown()));
                 continue;
             }
             result.add(new Column(column.name,
@@ -388,7 +381,7 @@ final class ArchiveStructureValidator {
                 knownPhysicalPrecision(databaseType, column.typeName, column.precision, column.scale)
                     || definition.scale == null ? column.scale : definition.scale,
                 column.nullable != DatabaseMetaData.columnNullableUnknown ? column.nullable : definition.nullable,
-                physicalNativeType(databaseType, definition)));
+                physicalNativeType(databaseType, definition), definition.defaultValue));
         }
         return result;
     }
@@ -660,13 +653,14 @@ final class ArchiveStructureValidator {
         String quotedTable = quoteTable(table, databaseType);
         if (definition == null) {
             statements.add("-- 归档表 " + comment(quotedTable) + " 的字段 " + comment(source.name)
-                + " 无法仅凭 JDBC 元数据还原定义（" + comment(source.describe()) + "），请人工生成 DDL。");
+                + " 无法仅凭元数据还原类型、可空性或默认值定义（" + comment(source.describe())
+                + "），请核对源物理字段默认值并人工生成 DDL。");
             return;
         }
         boolean modify = target != null;
         if (modify && !MigrationConstants.DB_MYSQL.equals(databaseType) && source.nullable == target.nullable) {
             definition = SqlSupport.quoteIdentifier(source.name, databaseType) + " "
-                + typeDefinition(source, databaseType);
+                + typeDefinition(source, databaseType) + source.defaultValue.clause(databaseType, databaseType);
         }
         String operation;
         if (MigrationConstants.DB_MYSQL.equals(databaseType)) {
@@ -690,12 +684,13 @@ final class ArchiveStructureValidator {
             String definition = columnDefinition(column, databaseType);
             if (definition == null || !names.add(normalize(column.name))) {
                 statements.add("-- 未生成 " + comment(quoteTable(table, databaseType))
-                    + " 的 CREATE TABLE：源字段有重复或其类型/可空定义无法安全还原，请人工处理。");
+                    + " 的 CREATE TABLE：源字段有重复或其类型/可空性/默认值定义无法安全还原，请人工处理。字段："
+                    + comment(column.describe()));
                 return;
             }
             definitions.add("    " + definition);
         }
-        statements.add("-- 先确认归档表确实不存在且账号具有查询权限；主键、索引、默认值、自增、字符集及注释须人工补齐。"
+        statements.add("-- 先确认归档表确实不存在且账号具有查询权限；主键、索引、自增、字符集及注释须人工补齐。"
             + LINE_BREAK + "CREATE TABLE " + quoteTable(table, databaseType) + " (" + LINE_BREAK
             + String.join("," + LINE_BREAK, definitions) + LINE_BREAK + ");");
     }
@@ -718,7 +713,9 @@ final class ArchiveStructureValidator {
         } else {
             return null;
         }
-        return SqlSupport.quoteIdentifier(column.name, databaseType) + " " + type + nullable;
+        String defaultClause = column.defaultValue.clause(databaseType, databaseType);
+        return defaultClause == null ? null
+            : SqlSupport.quoteIdentifier(column.name, databaseType) + " " + type + defaultClause + nullable;
     }
 
     /**
@@ -856,6 +853,7 @@ final class ArchiveStructureValidator {
             .append("-- 数据库类型：").append(databaseType).append(LINE_BREAK)
             .append("-- 以源物理表字段为准；工具不会未经确认执行，归档写入和删除尚未开始。\n")
             .append("-- 字段数量、名称、类型、精度、小数位及可空性之外的属性不在本次比对范围。\n\n")
+            .append("-- 上述结构差异生成 DDL 时携带已确认的源默认值；仅默认值不同不会单独触发差异。\n\n")
             .append("-- 本次校验问题\n");
         int number = 1;
         for (String issue : issues) {
@@ -1011,6 +1009,8 @@ final class ArchiveStructureValidator {
         private final int nullable;
         /** 补充取得的完整物理原生类型，保留 ENUM/SET 成员及转义。 */
         private final String nativeType;
+        /** 可靠取得的源默认值，未知与无默认值分别保存。 */
+        private final ColumnDefaultValue defaultValue;
 
         /**
          * Params: name 字段名；jdbcType/typeName 类型；precision/scale 精度；nullable 可空标志。
@@ -1026,6 +1026,16 @@ final class ArchiveStructureValidator {
          */
         private Column(String name, int jdbcType, String typeName, int precision, int scale, int nullable,
             String nativeType) {
+            this(name, jdbcType, typeName, precision, scale, nullable, nativeType, ColumnDefaultValue.none());
+        }
+
+        /**
+         * Params: name 字段名；jdbcType/typeName 类型；precision/scale 精度；nullable 可空性；
+         * nativeType 原生类型；defaultValue 物理字段默认值。
+         * Returns: 保留源默认值的物理字段定义。
+         */
+        private Column(String name, int jdbcType, String typeName, int precision, int scale, int nullable,
+            String nativeType, ColumnDefaultValue defaultValue) {
             this.name = name;
             this.jdbcType = jdbcType;
             this.typeName = typeName;
@@ -1033,6 +1043,7 @@ final class ArchiveStructureValidator {
             this.scale = scale;
             this.nullable = nullable;
             this.nativeType = nativeType;
+            this.defaultValue = defaultValue;
         }
 
         /**
@@ -1041,7 +1052,7 @@ final class ArchiveStructureValidator {
          */
         private String describe() {
             return typeName + "(" + precision + "," + scale + "),jdbcType=" + jdbcType + ",nullable=" + nullable
-                + (nativeType == null ? "" : ",nativeType=" + nativeType);
+                + (nativeType == null ? "" : ",nativeType=" + nativeType) + ",default=" + defaultValue.describe();
         }
     }
 }
